@@ -35,7 +35,7 @@ mutable struct MaxSumParams
 end
 
 # aux function to make graph generation consistent across platforms
-sortedpairs(d::Dict) = (k=>d[k] for k in sort!(collect(keys(d))))
+sortedpairs(d) = (k=>d[k] for k in sort!(collect(keys(d))))
 
 # Graph holds the graph structure onto which max-sum is run, in
 # sparse format
@@ -100,7 +100,7 @@ mutable struct Graph
             vdict0 = vdict[p0]
             for (vn,vdep) in sortedpairs(depsp)
                 v0 = vdict0[vn]
-                for (rp, rvs) in sortedpairs(vdep)
+                for (rp,rvs) in sortedpairs(vdep)
                     p1 = pdict[rp]
 
                     j0 = 1

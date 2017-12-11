@@ -13,8 +13,8 @@ import ..Types: uuid_julia
 export resolve, sanity_check
 
 # Use the max-sum algorithm to resolve packages dependencies
-function resolve(reqs::Requires, deps::DepsGraph, uuid_to_name::Dict{UUID,String})
-    id(p) = pkgID(p, uuid_to_name)
+function resolve(reqs::Requires, deps::DepsGraph)
+    id(p) = pkgID(p, deps)
 
     # init interface structures
     interface = Interface(reqs, deps)
@@ -62,13 +62,12 @@ function resolve(reqs::Requires, deps::DepsGraph, uuid_to_name::Dict{UUID,String
 end
 
 # Scan dependencies for (explicit or implicit) contradictions
-function sanity_check(deps::DepsGraph, uuid_to_name::Dict{UUID,String},
-                      pkgs::Set{UUID} = Set{UUID}())
-    id(p) = pkgID(p, uuid_to_name)
+function sanity_check(deps::DepsGraph, pkgs::Set{UUID} = Set{UUID}())
+    id(p) = pkgID(p, deps)
 
     isempty(pkgs) || (deps = Query.undirected_dependencies_subset(deps, pkgs))
 
-    deps, eq_classes = Query.prune_versions(deps, uuid_to_name)
+    deps, eq_classes = Query.prune_versions(deps)
 
     ndeps = Dict{UUID,Dict{VersionNumber,Int}}()
 
@@ -96,7 +95,7 @@ function sanity_check(deps::DepsGraph, uuid_to_name::Dict{UUID,String},
 
         fixed = Dict{UUID,Fixed}(p=>Fixed(vn, deps[p][vn]), uuid_julia=>Fixed(VERSION))
         sub_reqs = Requires()
-        bktrc = Query.init_resolve_backtrace(uuid_to_name, sub_reqs, fixed)
+        bktrc = Query.init_resolve_backtrace(deps.uuid_to_name, sub_reqs, fixed)
         Query.propagate_fixed!(sub_reqs, bktrc, fixed)
         sub_deps = Query.dependencies_subset(deps, Set{UUID}([p]))
         sub_deps, conflicts = Query.dependencies(sub_deps, fixed)
@@ -113,8 +112,8 @@ function sanity_check(deps::DepsGraph, uuid_to_name::Dict{UUID,String},
                         "of the following fixed packages: $sconflicts"))
                 end
             end
-            Query.check_requirements(sub_reqs, sub_deps, fixed, uuid_to_name)
-            sub_deps = Query.prune_dependencies(sub_reqs, sub_deps, uuid_to_name, bktrc)
+            Query.check_requirements(sub_reqs, sub_deps, fixed)
+            sub_deps = Query.prune_dependencies(sub_reqs, sub_deps, bktrc)
         catch err
             isa(err, PkgError) || rethrow(err)
             ## info("ERROR MESSAGE:\n" * err.msg)

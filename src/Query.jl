@@ -18,8 +18,8 @@ function init_resolve_backtrace(uuid_to_name::Dict{UUID,String}, reqs::Requires,
     return bktrc
 end
 
-function check_fixed(reqs::Requires, fix::Dict{UUID,Fixed}, deps::DepsGraph, uuid_to_name::Dict{UUID,String})
-    id(p) = pkgID(p, uuid_to_name)
+function check_fixed(reqs::Requires, fix::Dict{UUID,Fixed}, deps::DepsGraph)
+    id(p) = pkgID(p, deps)
     for (p1,f1) in fix
         for p2 in keys(f1.requires)
             if !(haskey(deps, p2) || haskey(fix, p2))
@@ -49,19 +49,6 @@ function propagate_fixed!(reqs::Requires, bktrc::ResolveBacktrace, fix::Dict{UUI
         delete!(reqs, p)
     end
     reqs
-end
-
-# Specialized copy for the deps argument below because the deepcopy is slow
-function depscopy(deps::DepsGraph)
-    new_deps = similar(deps)
-    for (p,depsp) in deps
-        new_depsp = similar(depsp)
-        for (vn,vdep) in depsp
-            new_depsp[vn] = copy(vdep)
-        end
-        new_deps[p] = new_depsp
-    end
-    return new_deps
 end
 
 # Generate a reverse dependency graph (package names only)
@@ -134,9 +121,8 @@ function dependencies(deps::DepsGraph, fix::Dict = Dict{UUID,Fixed}(uuid_julia=>
     deps, conflicts
 end
 
-function check_requirements(reqs::Requires, deps::DepsGraph, fix::Dict{UUID,Fixed},
-                            uuid_to_name::Dict{UUID,String})
-    id(p) = pkgID(p, uuid_to_name)
+function check_requirements(reqs::Requires, deps::DepsGraph, fix::Dict{UUID,Fixed})
+    id(p) = pkgID(p, deps)
     for (p,vs) in reqs
         any(vn->(vn ∈ vs), keys(deps[p])) && continue
         remaining_vs = VersionSpec()
@@ -168,9 +154,8 @@ end
 # The propagation is tracked so that in case a contradiction is detected the error
 # message allows to determine the cause.
 # This is a pre-pruning step, so it also creates some structures which are later used by pruning
-function filter_versions(reqs::Requires, deps::DepsGraph,
-                         bktrc::ResolveBacktrace, uuid_to_name::Dict{UUID,String})
-    id(p) = pkgID(p, uuid_to_name)
+function filter_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace)
+    id(p) = pkgID(p, deps)
     allowed = Dict{UUID,Dict{VersionNumber,Bool}}()
     staged = copy(reqs)
     while !isempty(staged)
@@ -247,7 +232,7 @@ function filter_versions(reqs::Requires, deps::DepsGraph,
         staged = staged_next
     end
 
-    filtered_deps = DepsGraph()
+    filtered_deps = DepsGraph(deps.uuid_to_name)
     for (p,depsp) in deps
         filtered_deps[p] = Dict{VersionNumber,Requires}()
         allowedp = get(allowed, p) do; Dict{VersionNumber,Bool}() end
@@ -268,8 +253,8 @@ end
 #      dependency relation, they are both required or both not required)
 #   2) They have the same dependencies
 # Preliminarily calls filter_versions.
-function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace, uuid_to_name::Dict{UUID,String})
-    filtered_deps, allowed = filter_versions(reqs, deps, bktrc, uuid_to_name)
+function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace)
+    filtered_deps, allowed = filter_versions(reqs, deps, bktrc)
     if !isempty(reqs)
         filtered_deps = dependencies_subset(filtered_deps, Set{UUID}(keys(reqs)))
     end
@@ -376,7 +361,7 @@ function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace
 
 
     # Recompute deps. We could simplify them, but it's not worth it
-    new_deps = DepsGraph()
+    new_deps = DepsGraph(deps.uuid_to_name)
 
     for (p,depsp) in filtered_deps
         @assert !haskey(new_deps, p)
@@ -415,12 +400,12 @@ function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace
 
     return new_deps, eq_classes
 end
-prune_versions(deps::DepsGraph, uuid_to_name::Dict{UUID,String}) =
-    prune_versions(Requires(), deps, ResolveBacktrace(uuid_to_name), uuid_to_name)
+prune_versions(deps::DepsGraph) =
+    prune_versions(Requires(), deps, ResolveBacktrace(deps.uuid_to_name))
 
 # Build a graph restricted to a subset of the packages
 function subdeps(deps::DepsGraph, pkgs::Set{UUID})
-    sub_deps = DepsGraph()
+    sub_deps = DepsGraph(deps.uuid_to_name)
     for p in pkgs
         haskey(sub_deps, p) || (sub_deps[p] = Dict{VersionNumber,Requires}())
         sub_depsp = sub_deps[p]
@@ -476,9 +461,9 @@ function undirected_dependencies_subset(deps::DepsGraph, pkgs::Set{UUID})
     return subdeps(deps, allpkgs)
 end
 
-function prune_dependencies(reqs::Requires, deps::DepsGraph, uuid_to_name::Dict{UUID,String},
-                            bktrc::ResolveBacktrace = init_resolve_backtrace(uuid_to_name, reqs))
-    deps, _ = prune_versions(reqs, deps, bktrc, uuid_to_name)
+function prune_dependencies(reqs::Requires, deps::DepsGraph,
+                            bktrc::ResolveBacktrace = init_resolve_backtrace(deps.uuid_to_name, reqs))
+    deps, _ = prune_versions(reqs, deps, bktrc)
     return deps
 end
 

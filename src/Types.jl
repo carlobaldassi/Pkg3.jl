@@ -8,7 +8,7 @@ import Pkg3
 import Pkg3: depots, logdir, iswindows
 
 export UUID, pkgID, SHA1, VersionRange, VersionSpec, empty_versionspec,
-    Requires, Fixed, DepsGraph, merge_requires!, satisfies,
+    Requires, Fixed, DepsGraph, merge_requires!, satisfies, depscopy,
     PkgError, ResolveBacktraceItem, ResolveBacktrace, showitem,
     PackageSpec, UpgradeLevel, EnvCache,
     CommandError, cmderror, has_name, has_uuid, write_env, parse_toml, find_registered!,
@@ -289,7 +289,45 @@ end
 satisfies(pkg::UUID, ver::VersionNumber, reqs::Requires) =
     !haskey(reqs, pkg) || in(ver, reqs[pkg])
 
-const DepsGraph = Dict{UUID,Dict{VersionNumber,Requires}}
+struct DepsGraph
+    graph::Dict{UUID,Dict{VersionNumber,Requires}}
+    uuid_to_name::Dict{UUID,String}
+    function DepsGraph(uuid_to_name::Dict{UUID,String} = Dict{UUID,String}())
+        graph = Dict{UUID,Dict{VersionNumber,Requires}}()
+        return new(graph, uuid_to_name)
+    end
+end
+
+Base.haskey(deps::DepsGraph, x) = haskey(deps.graph, x)
+Base.getindex(deps::DepsGraph, x) = getindex(deps.graph, x)
+Base.setindex!(deps::DepsGraph, x, vals...) = setindex!(deps.graph, x, vals...)
+Base.get(deps::DepsGraph, x, def) = get(deps.graph, x, def)
+Base.get!(deps::DepsGraph, x, def) = get!(deps.graphs, x, def)
+Base.get!(def::Base.Callable, deps::DepsGraph, x) = get!(def, deps.graphs, x)
+Base.keys(deps::DepsGraph) = keys(deps.graph)
+Base.delete!(deps::DepsGraph, x) = delete!(deps.graph, x)
+Base.valtype(deps::DepsGraph) = valtype(deps.graph)
+Base.keytype(deps::DepsGraph) = keytype(deps.graph)
+
+Base.start(deps::DepsGraph) = start(deps.graph)
+Base.next(deps::DepsGraph, state) = next(deps.graph, state)
+Base.done(deps::DepsGraph, state) = done(deps.graph, state)
+
+# This creates a deep copy of deps.graph but shares uuid_to_name
+function depscopy(deps::DepsGraph)
+    new_deps = DepsGraph(deps.uuid_to_name)
+    for (p,depsp) in deps
+        new_depsp = similar(depsp)
+        for (vn,vdep) in depsp
+            new_depsp[vn] = copy(vdep)
+        end
+        new_deps[p] = new_depsp
+    end
+    return new_deps
+end
+
+pkgID(p::UUID, deps::DepsGraph) = pkgID(p, deps.uuid_to_name)
+
 
 struct Fixed
     version::VersionNumber

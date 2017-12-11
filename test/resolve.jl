@@ -78,7 +78,7 @@ end
 wantuuids(want_data) = Dict{UUID,VersionNumber}(pkguuid(p) => v for (p,v) in want_data)
 
 function deps_from_data(deps_data, uuid_to_name = Dict{UUID,String}())
-    deps = DepsGraph()
+    deps = DepsGraph(uuid_to_name)
     uuid(p) = storeuuid(p, uuid_to_name)
     for d in deps_data
         p, vn, r = uuid(d[1]), d[2], d[3:end]
@@ -93,23 +93,28 @@ function deps_from_data(deps_data, uuid_to_name = Dict{UUID,String}())
         rvs = VersionSpec(r[2:end])
         deps[p][vn][rp] = rvs
     end
-    deps, uuid_to_name
+    deps
 end
-function reqs_from_data(reqs_data, uuid_to_name = Dict{UUID,String}())
+function reqs_from_data(reqs_data, deps::DepsGraph)
     reqs = Dict{UUID,VersionSpec}()
-    uuid(p) = storeuuid(p, uuid_to_name)
+    function uuid_check(p)
+        uuid = pkguuid(p)
+        @assert deps.uuid_to_name[uuid] == p
+        return uuid
+    end
     for r in reqs_data
-        p = uuid(r[1])
+        p = uuid_check(r[1])
         reqs[p] = VersionSpec(r[2:end])
     end
-    reqs, uuid_to_name
+    reqs
 end
 function sanity_tst(deps_data, expected_result; pkgs=[])
-    deps, uuid_to_name = deps_from_data(deps_data)
-    id(p) = pkgID(pkguuid(p), uuid_to_name)
+    deps = deps_from_data(deps_data)
+    id(p) = pkgID(pkguuid(p), deps)
     #println("deps=$deps")
     #println()
-    result = sanity_check(deps, uuid_to_name, Set(pkguuid(p) for p in pkgs))
+    result = sanity_check(deps, Set(pkguuid(p) for p in pkgs))
+
     length(result) == length(expected_result) || return false
     expected_result_uuid = [(id(p), vn) for (p,vn) in expected_result]
     for (p, vn, pp) in result
@@ -120,14 +125,14 @@ end
 sanity_tst(deps_data; kw...) = sanity_tst(deps_data, []; kw...)
 
 function resolve_tst(deps_data, reqs_data, want_data = nothing)
-    deps, uuid_to_name = deps_from_data(deps_data)
-    reqs, uuid_to_name = reqs_from_data(reqs_data, uuid_to_name)
+    deps = deps_from_data(deps_data)
+    reqs = reqs_from_data(reqs_data, deps)
 
     #println()
     #println("deps=$deps")
     #println("reqs=$reqs")
-    deps = Query.prune_dependencies(reqs, deps, uuid_to_name)
-    want = resolve(reqs, deps, uuid_to_name)
+    deps = Query.prune_dependencies(reqs, deps)
+    want = resolve(reqs, deps)
     return want == wantuuids(want_data)
 end
 

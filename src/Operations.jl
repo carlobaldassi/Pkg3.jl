@@ -114,8 +114,8 @@ end
 load_package_data(f::Base.Callable, path::String, version::VersionNumber) =
     get(load_package_data(f, path, [version]), version, nothing)
 
-function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec})
-    deps = DepsGraph()
+function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
+    deps = DepsGraph(uuid_to_name)
     uuids = [pkg.uuid for pkg in pkgs]
     seen = UUID[]
     while true
@@ -162,15 +162,15 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     end
     # construct data structures for resolver and call it
     reqs = Requires(pkg.uuid => pkg.version for pkg in pkgs)
-    deps = deps_graph(env, pkgs)
+    deps = deps_graph(env, pkgs, uuid_to_name)
     for dep_uuid in keys(deps)
         info = manifest_info(env, dep_uuid)
         if info != nothing
             uuid_to_name[UUID(info["uuid"])] = info["name"]
         end
     end
-    deps = Query.prune_dependencies(reqs, deps, uuid_to_name)
-    vers = Resolve.resolve(reqs, deps, uuid_to_name)
+    deps = Query.prune_dependencies(reqs, deps)
+    vers = Resolve.resolve(reqs, deps)
     find_registered!(env, collect(keys(vers)))
     # update vector of package versions
     for pkg in pkgs
