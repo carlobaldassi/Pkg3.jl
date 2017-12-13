@@ -8,6 +8,7 @@ else
 end
 
 include("resolve.jl")
+include("resolve_new.jl")
 include("operations.jl")
 
 end # module

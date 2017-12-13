@@ -2,8 +2,9 @@ module Operations
 
 using Base.Random: UUID
 using Base: LibGit2
-using Pkg3: TerminalMenus, Types, Query, Resolve
+using Pkg3: TerminalMenus, Types, Query, Resolve, ResolveNew
 import Pkg3: GLOBAL_SETTINGS, depots, BinaryProvider
+import Pkg3.Types: uuid_julia
 
 const SlugInt = UInt32 # max p = 4
 const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
@@ -90,6 +91,8 @@ end
 get_or_make(::Type{T}, d::Dict{K}, k::K) where {T,K} =
     haskey(d, k) ? convert(T, d[k]) : T()
 
+get_or_make!(d::Dict{K,V}, k::K) where {K,V} = get!(d, k) do; V() end
+
 function load_versions(path::String)
     toml = parse_toml(path, "versions.toml")
     Dict(VersionNumber(ver) => SHA1(info["hash-sha1"]) for (ver, info) in toml)
@@ -114,6 +117,71 @@ end
 load_package_data(f::Base.Callable, path::String, version::VersionNumber) =
     get(load_package_data(f, path, [version]), version, nothing)
 
+function load_package_data_raw(T::Type, path::String)
+    toml = parse_toml(path, fakeit=true)
+    data = Dict{VersionRange,Dict{String,T}}()
+    for (v, d) in toml, (key, value) in d
+        vr = VersionRange(v)
+        dict = get!(data, vr, Dict{String,T}())
+        haskey(dict, key) && cmderror("$ver/$key is duplicated in $path")
+        dict[key] = T(value)
+    end
+    return data
+end
+
+function deps_graph_new(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
+    uuids = [pkg.uuid for pkg in pkgs]
+    seen = UUID[]
+
+    all_versions = Dict{UUID,Set{VersionNumber}}(uuid_julia=>Set([VERSION]))
+    all_deps = Dict{UUID,Dict{VersionRange,Dict{String,UUID}}}(uuid_julia=>Dict())
+    all_compat = Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}}(uuid_julia=>Dict())
+    while true
+        unseen = setdiff(uuids, seen)
+        isempty(unseen) && break
+        for uuid in unseen
+            push!(seen, uuid)
+            all_versions_u = get_or_make!(all_versions, uuid)
+            all_deps_u = get!(all_deps, uuid) do; Dict(VersionRange()=>Dict{String,UUID}("julia"=>uuid_julia)) end
+            all_compat_u = get_or_make!(all_compat, uuid)
+            for path in registered_paths(env, uuid)
+                version_info = load_versions(path)
+                versions = sort!(collect(keys(version_info)))
+                deps_data = load_package_data_raw(UUID, joinpath(path, "dependencies.toml"))
+                compatibility_data = load_package_data_raw(VersionSpec, joinpath(path, "compatibility.toml"))
+
+                union!(all_versions_u, versions)
+
+                for (vr,dd) in deps_data
+                    all_deps_u_vr = get_or_make!(all_deps_u, vr)
+                    for (name,other_uuid) in dd
+                        # check conflicts??
+                        all_deps_u_vr[name] = other_uuid
+                        other_uuid in uuids || push!(uuids, other_uuid)
+                    end
+                end
+                for (vr,cd) in compatibility_data
+                    all_compat_u_vr = get_or_make!(all_compat_u, vr)
+                    for (name,vs) in cd
+                        # check conflicts??
+                        all_compat_u_vr[name] = vs
+                    end
+                end
+                # dependencies = load_package_data(UUID, joinpath(path, "dependencies.toml"), versions)
+                # compatibility = load_package_data(VersionSpec, joinpath(path, "compatibility.toml"), versions)
+                # for v in versions
+                #     d = get_or_make(Dict{String,UUID}, dependencies, v)
+                #     for (p, u) in d
+                #         u in uuids || push!(uuids, u)
+                #     end
+                # end
+            end
+        end
+        find_registered!(env, uuids)
+    end
+    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name)
+end
+
 function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
     deps = DepsGraph(uuid_to_name)
     uuids = [pkg.uuid for pkg in pkgs]
@@ -129,6 +197,11 @@ function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict
                 versions = sort!(collect(keys(version_info)))
                 dependencies = load_package_data(UUID, joinpath(path, "dependencies.toml"), versions)
                 compatibility = load_package_data(VersionSpec, joinpath(path, "compatibility.toml"), versions)
+                # if uuid == UUID(0xa8cc5b0e_0ffa_5ad4_8c14_923d3ee1735f)
+                #     @show path
+                #     @show uuid_to_name[uuid]
+                #     @show compatibility
+                # end
                 for v in versions
                     d = get_or_make(Dict{String,UUID}, dependencies, v)
                     r = get_or_make(Dict{String,VersionSpec}, compatibility, v)
@@ -139,6 +212,11 @@ function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict
                         u in uuids || push!(uuids, u)
                     end
                 end
+                # if uuid == UUID(0xa8cc5b0e_0ffa_5ad4_8c14_923d3ee1735f)
+                #     for v in keys(deps[uuid])
+                #         @show v, deps[uuid][v]
+                #     end
+                # end
             end
         end
         find_registered!(env, uuids)
@@ -163,6 +241,8 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     # construct data structures for resolver and call it
     reqs = Requires(pkg.uuid => pkg.version for pkg in pkgs)
     deps = deps_graph(env, pkgs, uuid_to_name)
+    deps_new = deps_graph_new(env, pkgs, uuid_to_name)
+
     for dep_uuid in keys(deps)
         info = manifest_info(env, dep_uuid)
         if info != nothing
@@ -171,6 +251,10 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     end
     deps = Query.prune_dependencies(reqs, deps)
     vers = Resolve.resolve(reqs, deps)
+    vers_new = ResolveNew.resolve(reqs, deps_new)
+    @assert get(vers_new, uuid_julia, nothing) == VERSION
+    delete!(vers_new, uuid_julia)
+    @assert vers == vers_new
     find_registered!(env, collect(keys(vers)))
     # update vector of package versions
     for pkg in pkgs

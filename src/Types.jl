@@ -9,6 +9,7 @@ import Pkg3: depots, logdir, iswindows
 
 export UUID, pkgID, SHA1, VersionRange, VersionSpec, empty_versionspec,
     Requires, Fixed, DepsGraph, merge_requires!, satisfies, depscopy,
+    NewGraph,
     PkgError, ResolveBacktraceItem, ResolveBacktrace, showitem,
     PackageSpec, UpgradeLevel, EnvCache,
     CommandError, cmderror, has_name, has_uuid, write_env, parse_toml, find_registered!,
@@ -328,7 +329,6 @@ end
 
 pkgID(p::UUID, deps::DepsGraph) = pkgID(p, deps.uuid_to_name)
 
-
 struct Fixed
     version::VersionNumber
     requires::Requires
@@ -342,6 +342,196 @@ Base.show(io::IO, f::Fixed) = isempty(f.requires) ?
     print(io, "Fixed(", repr(f.version), ")") :
     print(io, "Fixed(", repr(f.version), ",", f.requires, ")")
 
+
+
+
+mutable struct GraphData
+    # packages list
+    pkgs::Vector{UUID}
+
+    # number of packages
+    np::Int
+
+    # states per package: one per version + uninstalled
+    spp::Vector{Int}
+
+    # pakage dict: associates an index to each package id
+    pdict::Dict{UUID,Int}
+
+    # package versions: for each package, keep the list of the
+    #                   possible version numbers; this defines a
+    #                   mapping from version numbers of a package
+    #                   to indices
+    pvers::Vector{Vector{VersionNumber}}
+
+    # versions dict: associates a version index to each package
+    #                version; such that
+    #                  pvers[p0][vdict[p0][vn]] = vn
+    vdict::Vector{Dict{VersionNumber,Int}}
+
+    uuid_to_name::Dict{UUID,String}
+
+    function GraphData(
+            versions::Dict{UUID,Set{VersionNumber}},
+            deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
+            compat::Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}},
+            uuid_to_name::Dict{UUID,String}
+        )
+        # generate pkgs
+        pkgs = sort!(collect(keys(versions)))
+        np = length(pkgs)
+
+        # generate pdict
+        pdict = Dict{UUID,Int}(pkgs[p0] => p0 for p0 = 1:np)
+
+        # generate spp and pvers
+        pvers = [sort!(collect(versions[pkgs[p0]])) for p0 = 1:np]
+        spp = length.(pvers) .+ 1
+
+        # generate vdict
+        vdict = [Dict{VersionNumber,Int}(vn => i for (i,vn) in enumerate(pvers[p0])) for p0 = 1:np]
+
+        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name)
+    end
+end
+
+@enum DepDir FORWARD BACKWARDS BIDIR NONE
+
+function update_depdir(dd0::DepDir, dd1::DepDir)
+    dd0 == dd1 && return dd0
+    dd0 == NONE && return dd1
+    dd1 == NONE && return dd0
+    return BIDIR
+end
+
+mutable struct NewGraph
+    # data:
+    #   stores all the structures required to map between
+    #   parsed items (names, UUIDS, version numbers...) and
+    #   the numeric representation used in the main Graph data
+    #   structure.
+    data::GraphData
+
+    # adjacency matrix:
+    #   for each package, has the list of neighbors
+    #   indices
+    gadj::Vector{Vector{Int}}
+
+    # compatibility mask:
+    #   for each package p0 has a list of bool masks.
+    #   Each entry in the list gmsk[p0] is relative to the
+    #   package p1 as read from gadj[p0].
+    #   Each mask has dimension spp1 x spp0, where
+    #   spp0 is the number of states of p0, and
+    #   spp1 is the number of states of p1.
+    gmsk::Vector{Vector{BitMatrix}}
+
+    # dependency direction:
+    #   keeps track of which direction the dependency goes.
+    gdir::Vector{Vector{DepDir}}
+
+    # adjacency dict:
+    #   allows one to retrieve the indices in gadj, so that
+    #   gadj[p0][adjdict[p1][p0]] = p1
+    #   ("At which index does package p1 appear in gadj[p0]?")
+    adjdict::Vector{Dict{Int,Int}}
+
+    # states per package: same as in GraphData
+    spp::Vector{Int}
+
+    # number of packages (all Vectors above have this length)
+    np::Int
+
+    function NewGraph(
+            versions::Dict{UUID,Set{VersionNumber}},
+            deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
+            compat::Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}},
+            uuid_to_name::Dict{UUID,String}
+        )
+
+        data = GraphData(versions, deps, compat, uuid_to_name)
+        pkgs, np, spp, pdict, pvers, vdict = data.pkgs, data.np, data.spp, data.pdict, data.pvers, data.vdict
+
+        extended_deps = [[Dict{Int,VersionSpec}() for v0 = 1:(spp[p0]-1)] for p0 = 1:np]
+        for p0 = 1:np, v0 = 1:(spp[p0]-1)
+            n2u = Dict{String,UUID}()
+            vn = pvers[p0][v0]
+            for (vr,vrmap) in deps[pkgs[p0]]
+                vn ∈ vr || continue
+                for (name,uuid) in vrmap
+                    # check conflicts ??
+                    n2u[name] = uuid
+                end
+            end
+            req = Dict{Int,VersionSpec}()
+            for (vr,vrmap) in compat[pkgs[p0]]
+                vn ∈ vr || continue
+                for (name,vs) in vrmap
+                    haskey(n2u, name) || error("Unknown package $name found in the compatibility requirements of $(pkgID(pkgs[p0], uuid_to_name))")
+                    uuid = n2u[name]
+                    p1 = pdict[uuid]
+                    # check conflicts instead of intersecting?
+                    req_p1 = get!(req, p1) do; VersionSpec() end
+                    req[p1] = req_p1 ∩ vs
+                end
+            end
+            # The remaining dependencies do not have compatibility constraints
+            for uuid in values(n2u)
+                get!(req, pdict[uuid]) do; VersionSpec() end
+            end
+            extended_deps[p0][v0] = req
+        end
+
+        gadj = [Int[] for p0 = 1:np]
+        gmsk = [BitMatrix[] for p0 = 1:np]
+        gdir = [DepDir[] for p0 = 1:np]
+        adjdict = [Dict{Int,Int}() for p0 = 1:np]
+
+        for p0 = 1:np, v0 = 1:(spp[p0]-1), (p1,rvs) in extended_deps[p0][v0]
+            j0 = get(adjdict[p1], p0, length(gadj[p0]) + 1)
+            j1 = get(adjdict[p0], p1, length(gadj[p1]) + 1)
+
+            @assert (j0 > length(gadj[p0]) && j1 > length(gadj[p1])) ||
+                    (j0 ≤ length(gadj[p0]) && j1 ≤ length(gadj[p1]))
+
+            if j0 > length(gadj[p0])
+                push!(gadj[p0], p1)
+                push!(gadj[p1], p0)
+                j0 = length(gadj[p0])
+                j1 = length(gadj[p1])
+
+                adjdict[p1][p0] = j0
+                adjdict[p0][p1] = j1
+
+                bm = trues(spp[p1], spp[p0])
+                bmt = bm'
+
+                push!(gmsk[p0], bm)
+                push!(gmsk[p1], bmt)
+
+                push!(gdir[p0], FORWARD)
+                push!(gdir[p1], BACKWARDS)
+            else
+                bm = gmsk[p0][j0]
+                bmt = gmsk[p1][j1]
+                gdir[p0][j0] = update_depdir(gdir[p0][j0], FORWARD)
+                gdir[p1][j1] = update_depdir(gdir[p1][j1], BACKWARDS)
+            end
+
+            for v1 = 1:length(pvers[p1])
+                pvers[p1][v1] ∈ rvs && continue
+                bm[v1, v0] = false
+                bmt[v0, v1] = false
+            end
+            bm[end,v0] = false
+            bmt[v0,end] = false
+        end
+
+        return new(data, gadj, gmsk, gdir, adjdict, spp, np)
+    end
+end
+
+pkgID(p::UUID, graph::NewGraph) = pkgID(p, graph.data.uuid_to_name)
 
 struct PkgError <: Exception
     msg::AbstractString
@@ -1022,12 +1212,12 @@ function find_registered!(
             for line in eachline(io)
                 ismatch(r"^ \s* \[ \s* packages \s* \] \s* $"x, line) && break
             end
-            # fine lines with uuid or name we're looking for
+            # find lines with uuid or name we're looking for
             for line in eachline(io)
                 ismatch(regex, line) || continue
                 m = match(line_re, line)
                 m == nothing &&
-                    error("misformated registry.toml package entry: $line")
+                    error("misformatted registry.toml package entry: $line")
                 uuid = UUID(m.captures[1])
                 name = Base.unescape_string(m.captures[2])
                 path = abspath(registry, Base.unescape_string(m.captures[3]))
