@@ -56,9 +56,11 @@ mutable struct Messages
     decimated::BitVector
     num_nondecimated::Int
 
-    function Messages(graph::NewGraph, reqs::Requires)
+    function Messages(graph::NewGraph)
         np = graph.np
         spp = graph.spp
+        gconstr = graph.gconstr
+        req_inds = graph.req_inds
         pvers = graph.data.pvers
         pdict = graph.data.pdict
 
@@ -68,26 +70,28 @@ mutable struct Messages
         # external fields: favor newest versions over older, and no-version over all
         fld = [[FieldValue(0, zero(VersionWeight), vweight[p0][v0], (v0==spp[p0]), 0) for v0 = 1:spp[p0]] for p0 = 1:np]
 
-        # enforce requirements
-        for (rp,rvs) in reqs
-            p0 = pdict[rp]
-            pvers0 = pvers[p0]
+        # enforce constraints
+        for p0 = 1:np
             fld0 = fld[p0]
-            for v0 = 1:spp[p0]-1
-                vn = pvers0[v0]
-                if vn ∉ rvs
-                    # the state is forbidden by requirements
-                    fld0[v0] = FieldValue(-1)
-                else
-                    # the state is one of those explicitly requested:
-                    # favor it at a higer level than normal (upgrade
-                    # FieldValue from l2 to l1)
-                    fld0[v0] += FieldValue(0, vweight[p0][v0], -vweight[p0][v0])
-                end
+            gconstr0 = gconstr[p0]
+            for v0 = 1:spp[p0]
+                gconstr0[v0] || (fld0[v0] = FieldValue(-1))
             end
-            # the uninstalled state is forbidden by requirements
-            fld0[spp[p0]] = FieldValue(-1)
         end
+
+        # favor explicit requirements
+        for rp0 in req_inds
+            fld0 = fld[rp0]
+            gconstr0 = gconstr[rp0]
+            for v0 = 1:spp[rp0]-1
+                gconstr0[v0] || continue
+                # the state is one of those explicitly requested:
+                # favor it at a higer level than normal (upgrade
+                # FieldValue from l2 to l1)
+                fld0[v0] += FieldValue(0, vweight[rp0][v0], -vweight[rp0][v0])
+            end
+        end
+
         # normalize fields
         for p0 = 1:np
             fld[p0] .-= maximum(fld[p0])

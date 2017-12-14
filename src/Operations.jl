@@ -129,20 +129,20 @@ function load_package_data_raw(T::Type, path::String)
     return data
 end
 
-function deps_graph_new(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
-    uuids = [pkg.uuid for pkg in pkgs]
+function deps_graph_new(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Requires, fixed::Dict{UUID,Fixed})
+    uuids = union(keys(reqs), keys(fixed), map(fx->keys(fx.requires), values(fixed))...)
     seen = UUID[]
 
-    all_versions = Dict{UUID,Set{VersionNumber}}(uuid_julia=>Set([VERSION]))
-    all_deps = Dict{UUID,Dict{VersionRange,Dict{String,UUID}}}(uuid_julia=>Dict())
-    all_compat = Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}}(uuid_julia=>Dict())
+    all_versions = Dict{UUID,Set{VersionNumber}}(fp => Set([fx.version]) for (fp,fx) in fixed)
+    all_deps = Dict{UUID,Dict{VersionRange,Dict{String,UUID}}}(fp => Dict(VersionRange(fx.version) => Dict()) for (fp,fx) in fixed)
+    all_compat = Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}}(fp => Dict(VersionRange(fx.version) => Dict()) for (fp,fx) in fixed)
     while true
         unseen = setdiff(uuids, seen)
         isempty(unseen) && break
         for uuid in unseen
             push!(seen, uuid)
             all_versions_u = get_or_make!(all_versions, uuid)
-            all_deps_u = get!(all_deps, uuid) do; Dict(VersionRange()=>Dict{String,UUID}("julia"=>uuid_julia)) end
+            all_deps_u = get!(all_deps, uuid) do; Dict(VersionRange() => Dict("julia" => uuid_julia)) end
             all_compat_u = get_or_make!(all_compat, uuid)
             for path in registered_paths(env, uuid)
                 version_info = load_versions(path)
@@ -179,7 +179,7 @@ function deps_graph_new(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::
         end
         find_registered!(env, uuids)
     end
-    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name)
+    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name, reqs, fixed)
 end
 
 function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
@@ -240,8 +240,9 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     end
     # construct data structures for resolver and call it
     reqs = Requires(pkg.uuid => pkg.version for pkg in pkgs)
+    fixed = Dict([uuid_julia => Fixed(VERSION)])
     deps = deps_graph(env, pkgs, uuid_to_name)
-    deps_new = deps_graph_new(env, pkgs, uuid_to_name)
+    deps_new = deps_graph_new(env, uuid_to_name, reqs, fixed)
 
     for dep_uuid in keys(deps)
         info = manifest_info(env, dep_uuid)
@@ -251,7 +252,7 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     end
     deps = Query.prune_dependencies(reqs, deps)
     vers = Resolve.resolve(reqs, deps)
-    vers_new = ResolveNew.resolve(reqs, deps_new)
+    vers_new = ResolveNew.resolve(deps_new)
     @assert get(vers_new, uuid_julia, nothing) == VERSION
     delete!(vers_new, uuid_julia)
     @assert vers == vers_new

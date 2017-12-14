@@ -92,9 +92,10 @@ end
 function deps_from_data(deps_data, uuid_to_name = Dict{UUID,String}(Types.uuid_julia=>"julia"))
     uuid(p) = storeuuid(p, uuid_to_name)
     # deps = DepsGraph(uuid_to_name)
-    all_versions = Dict{UUID,Set{VersionNumber}}(Types.uuid_julia=>Set([VERSION]))
-    all_deps = Dict{UUID,Dict{VersionRange,Dict{String,UUID}}}(Types.uuid_julia=>Dict())
-    all_compat = Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}}(Types.uuid_julia=>Dict())
+    fixed = Dict(Types.uuid_julia => Fixed(VERSION))
+    all_versions = Dict{UUID,Set{VersionNumber}}(fp => Set([fx.version]) for (fp,fx) in fixed)
+    all_deps = Dict{UUID,Dict{VersionRange,Dict{String,UUID}}}(fp => Dict(VersionRange(fx.version)=>Dict()) for (fp,fx) in fixed)
+    all_compat = Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}}(fp => Dict(VersionRange(fx.version)=>Dict()) for (fp,fx) in fixed)
 
     deps = Dict{String,Dict{VersionNumber,Dict{String,VersionSpec}}}()
     for d in deps_data
@@ -144,7 +145,7 @@ function deps_from_data(deps_data, uuid_to_name = Dict{UUID,String}(Types.uuid_j
             end
         end
     end
-    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name)
+    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name, Requires(), fixed)
 end
 function reqs_from_data(reqs_data, deps::NewGraph)
     reqs = Dict{UUID,VersionSpec}()
@@ -178,11 +179,13 @@ sanity_tst(deps_data; kw...) = sanity_tst(deps_data, []; kw...)
 function resolve_tst(deps_data, reqs_data, want_data = nothing)
     deps = deps_from_data(deps_data)
     reqs = reqs_from_data(reqs_data, deps)
+    add_reqs!(deps, reqs, explicit=true)
 
     # deps = Query.prune_dependencies(reqs, deps) # XXX TODO
-    want = resolve(reqs, deps)
+    want = resolve(deps)
     @assert want[Types.uuid_julia] == VERSION
     delete!(want, Types.uuid_julia)
+
     return want == wantuuids(want_data)
 end
 

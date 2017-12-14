@@ -9,7 +9,7 @@ import Pkg3: depots, logdir, iswindows
 
 export UUID, pkgID, SHA1, VersionRange, VersionSpec, empty_versionspec,
     Requires, Fixed, DepsGraph, merge_requires!, satisfies, depscopy,
-    NewGraph,
+    NewGraph, add_reqs!, add_fixed!,
     PkgError, ResolveBacktraceItem, ResolveBacktrace, showitem,
     PackageSpec, UpgradeLevel, EnvCache,
     CommandError, cmderror, has_name, has_uuid, write_env, parse_toml, find_registered!,
@@ -371,11 +371,16 @@ mutable struct GraphData
 
     uuid_to_name::Dict{UUID,String}
 
+    reqs::Requires
+    fixed::Dict{UUID,Fixed}
+
     function GraphData(
             versions::Dict{UUID,Set{VersionNumber}},
             deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
             compat::Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}},
-            uuid_to_name::Dict{UUID,String}
+            uuid_to_name::Dict{UUID,String},
+            reqs::Requires,
+            fixed::Dict{UUID,Fixed}
         )
         # generate pkgs
         pkgs = sort!(collect(keys(versions)))
@@ -391,7 +396,7 @@ mutable struct GraphData
         # generate vdict
         vdict = [Dict{VersionNumber,Int}(vn => i for (i,vn) in enumerate(pvers[p0])) for p0 = 1:np]
 
-        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name)
+        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name, reqs, fixed)
     end
 end
 
@@ -430,11 +435,20 @@ mutable struct NewGraph
     #   keeps track of which direction the dependency goes.
     gdir::Vector{Vector{DepDir}}
 
+    # constraints:
+    #   a mask of allowed states for each package (e.g. to express
+    #   requirements)
+    gconstr::Vector{BitVector}
+
     # adjacency dict:
     #   allows one to retrieve the indices in gadj, so that
     #   gadj[p0][adjdict[p1][p0]] = p1
     #   ("At which index does package p1 appear in gadj[p0]?")
     adjdict::Vector{Dict{Int,Int}}
+
+    # indices of the packages that were *explicitly* required
+    #   used to favor their versions at resolution
+    req_inds::Set{Int}
 
     # states per package: same as in GraphData
     spp::Vector{Int}
@@ -446,10 +460,15 @@ mutable struct NewGraph
             versions::Dict{UUID,Set{VersionNumber}},
             deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
             compat::Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}},
-            uuid_to_name::Dict{UUID,String}
+            uuid_to_name::Dict{UUID,String},
+            reqs::Requires = Requires(),
+            fixed::Dict{UUID,Fixed} = Dict{UUID,Fixed}(uuid_julia=>Fixed(VERSION))
         )
 
-        data = GraphData(versions, deps, compat, uuid_to_name)
+        extra_uuids = union(keys(reqs), keys(fixed), map(fx->keys(fx.requires), values(fixed))...)
+        extra_uuids ⊆ keys(versions) || error("unknown UUID found in reqs/fixed") # TODO?
+
+        data = GraphData(versions, deps, compat, uuid_to_name, reqs, fixed)
         pkgs, np, spp, pdict, pvers, vdict = data.pkgs, data.np, data.spp, data.pdict, data.pvers, data.vdict
 
         extended_deps = [[Dict{Int,VersionSpec}() for v0 = 1:(spp[p0]-1)] for p0 = 1:np]
@@ -471,6 +490,7 @@ mutable struct NewGraph
                     uuid = n2u[name]
                     p1 = pdict[uuid]
                     # check conflicts instead of intersecting?
+                    # (intersecting is used by fixed packages though...)
                     req_p1 = get!(req, p1) do; VersionSpec() end
                     req[p1] = req_p1 ∩ vs
                 end
@@ -485,6 +505,7 @@ mutable struct NewGraph
         gadj = [Int[] for p0 = 1:np]
         gmsk = [BitMatrix[] for p0 = 1:np]
         gdir = [DepDir[] for p0 = 1:np]
+        gconstr = [trues(spp[p0]) for p0 = 1:np]
         adjdict = [Dict{Int,Int}() for p0 = 1:np]
 
         for p0 = 1:np, v0 = 1:(spp[p0]-1), (p1,rvs) in extended_deps[p0][v0]
@@ -527,8 +548,55 @@ mutable struct NewGraph
             bmt[v0,end] = false
         end
 
-        return new(data, gadj, gmsk, gdir, adjdict, spp, np)
+        req_inds = Set{Int}()
+
+        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, spp, np)
+
+        add_reqs!(graph, reqs, explicit = true)
+        add_fixed!(graph, fixed)
+
+        return graph
     end
+end
+
+function add_reqs!(graph::NewGraph, reqs::Requires; explicit::Bool = false)
+    gconstr = graph.gconstr
+    spp = graph.spp
+    req_inds = graph.req_inds
+    pdict = graph.data.pdict
+    pvers = graph.data.pvers
+
+    for (rp,rvs) in reqs
+        haskey(pdict, rp) || error("unknown required package $(pkgID(rp, graph))")
+        rp0 = pdict[rp]
+        gconstr0 = gconstr[rp0]
+        gconstr0[end] = false
+        for rv0 = 1:(spp[rp0]-1)
+            rvn = pvers[rp0][rv0]
+            rvn ∈ rvs || (gconstr0[rv0] = false)
+        end
+        explicit && push!(req_inds, rp0)
+    end
+    # TODO: add reqs in GraphData
+    return graph
+end
+
+function add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
+    gconstr = graph.gconstr
+    spp = graph.spp
+    pdict = graph.data.pdict
+    vdict = graph.data.vdict
+
+    for (fp,fx) in fixed
+        haskey(pdict, fp) || error("unknown fixed package $(pkgID(fp, graph))")
+        fp0 = pdict[fp]
+        fv0 = vdict[fp0][fx.version]
+        fill!(gconstr[fp0], false)
+        gconstr[fp0][fv0] = true
+        add_reqs!(graph, fx.requires)
+    end
+    # TODO: add fixed in GraphData
+    return graph
 end
 
 pkgID(p::UUID, graph::NewGraph) = pkgID(p, graph.data.uuid_to_name)

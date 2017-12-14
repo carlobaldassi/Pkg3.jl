@@ -12,16 +12,16 @@ import ..Types: uuid_julia
 export resolve, sanity_check
 
 # Use the max-sum algorithm to resolve packages dependencies
-function resolve(reqs::Requires, graph::NewGraph)
+function resolve(graph::NewGraph)
     id(p) = pkgID(p, graph)
 
     # attempt trivial solution first
-    ok, sol = greedysolver(reqs, graph)
+    ok, sol = greedysolver(graph)
 
     ok && @goto solved
 
     # trivial solution failed, use maxsum solver
-    msgs = Messages(graph, reqs)
+    msgs = Messages(graph)
 
     try
         sol = maxsum(graph, msgs)
@@ -49,8 +49,8 @@ function resolve(reqs::Requires, graph::NewGraph)
     end
 
     # verify solution (debug code) and enforce its optimality
-    @assert verify_solution(sol, reqs, graph)
-    enforce_optimality!(sol, reqs, graph)
+    @assert verify_solution(sol, graph)
+    enforce_optimality!(sol, graph)
 
     @label solved
 
@@ -182,35 +182,32 @@ end
 
 # Produce a trivial solution: try to maximize each version;
 # bail out as soon as some non-trivial requirements are detected.
-function greedysolver(reqs::Requires, graph::NewGraph)
+function greedysolver(graph::NewGraph)
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
-    gdir = graph.gdir
-    pdict = graph.data.pdict
-    pvers = graph.data.pvers
+    gconstr = graph.gconstr
     np = graph.np
 
     # initialize solution: all uninstalled
     sol = [spp[p0] for p0 = 1:np]
 
+    # packages which are not allowed to be uninstalled
+    # (NOTE: this is potentially a superset of graph.req_inds,
+    #        since it may include implicit requirements)
+    req_inds = Set{Int}(p0 for p0 = 1:np if !gconstr[p0][end])
+
     # set up required packages to their highest allowed versions
-    for (rp,rvs) in reqs
-        rp0 = pdict[rp]
+    for rp0 in req_inds
         # look for the highest version which satisfies the requirements
-        rv0 = spp[rp0] - 1
-        while rv0 > 0
-            rvn = pvers[rp0][rv0]
-            rvn ∈ rvs && break
-            rv0 -= 1
-        end
-        @assert rv0 > 0
+        rv0 = findlast(gconstr[rp0])
+        @assert rv0 ≠ 0 && rv0 ≠ spp[rp0]
         sol[rp0] = rv0
     end
 
     # we start from required packages and explore the graph
     # following dependencies
-    staged = Set{Int}(pdict[rp] for rp in keys(reqs))
+    staged = req_inds
     seen = copy(staged)
 
     while !isempty(staged)
@@ -222,14 +219,9 @@ function greedysolver(reqs::Requires, graph::NewGraph)
             # scan dependencies
             for (j1,p1) in enumerate(gadj[p0])
                 msk = gmsk[p0][j1]
-                msk[end,s0] && continue # p1 is not required by p0's current version
-
                 # look for the highest version which satisfies the requirements
-                v1 = spp[p1] - 1
-                while v1 > 0
-                    msk[v1,s0] && break
-                    v1 -= 1
-                end
+                v1 = findlast(msk[:,s0] .& gconstr[p1])
+                v1 == spp[p1] && continue # p1 is not required by p0's current version
                 # if we found a version, and the package was uninstalled
                 # or the same version was already selected, we're ok;
                 # otherwise we can't be sure what the optimal configuration is
@@ -247,32 +239,24 @@ function greedysolver(reqs::Requires, graph::NewGraph)
         staged = staged_next
     end
 
-    @assert verify_solution(sol, reqs, graph)
+    @assert verify_solution(sol, graph)
 
     return true, sol
 end
 
 # verifies that the solution fulfills all hard constraints
 # (requirements and dependencies)
-function verify_solution(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
+function verify_solution(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
-    pdict = graph.data.pdict
-    pvers = graph.data.pvers
+    gconstr = graph.gconstr
 
-    # verify requirements
-    for (p,vs) in reqs
-        p0 = pdict[p]
-        sol[p0] ≠ spp[p0] || return false # TODO: print debug info
-        vn = pvers[p0][sol[p0]]
-        vn ∈ vs || return false # TODO: print debug info
-    end
-
-    # verify dependencies
+    # verify constraints and dependencies
     for p0 = 1:np
         s0 = sol[p0]
+        gconstr[p0][s0] || return false
         for (j1,p1) in enumerate(gadj[p0])
             msk = gmsk[p0][j1]
             s1 = sol[p1]
@@ -283,32 +267,23 @@ function verify_solution(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
 end
 
 # Push the given solution to a local optimium if needed
-function enforce_optimality!(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
+function enforce_optimality!(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
-
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
     gdir = graph.gdir
-    pkgs = graph.data.pkgs
-    pdict = graph.data.pdict
-    pvers = graph.data.pvers
+    gconstr = graph.gconstr
 
     restart = true
     while restart
         restart = false
         for p0 = 1:np
             s0 = sol[p0]
-            s0 == spp[p0] && continue # the package is not installed,
+            s0 == spp[p0] && continue # the package is not installed
 
-            # check if bumping to the higher version would violate a requirement
-            p = pkgs[p0]
-            if haskey(reqs, p)
-                s0 == spp[p0] - 1 && continue # can't uninstall!
-                vs = reqs[p]
-                vn = pvers[p0][s0+1]
-                vn ∈ vs || continue
-            end
+            # check if bumping to the higher version would violate a constraint
+            gconstr[p0][s0+1] || continue
 
             # check if bumping to the higher version would violate a constraint
             viol = false
@@ -332,7 +307,7 @@ function enforce_optimality!(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
     # start from the required ones and keep only
     # the packages reachable from them along the graph
     uninst = trues(np)
-    staged = Set{Int}(pdict[rp] for rp in keys(reqs))
+    staged = Set{Int}(p0 for p0 = 1:np if !gconstr[p0][end])
     seen = copy(staged)
 
     while !isempty(staged)
@@ -342,8 +317,7 @@ function enforce_optimality!(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
             @assert s0 < spp[p0]
             uninst[p0] = false
             for (j1,p1) in enumerate(gadj[p0])
-                sol[p1] < spp[p1] || continue
-                gdir[p0][j1] ∈ (Types.BACKWARDS, Types.NONE) && continue
+                gmsk[p0][j1][end,s0] && continue # the package is not required by p0 at version s0
                 p1 ∈ seen || push!(staged_next, p1)
             end
         end
@@ -355,7 +329,7 @@ function enforce_optimality!(sol::Vector{Int}, reqs::Requires, graph::NewGraph)
         sol[p0] = spp[p0]
     end
 
-    @assert verify_solution(sol, reqs, graph)
+    @assert verify_solution(sol, graph)
 end
 
 end # module
