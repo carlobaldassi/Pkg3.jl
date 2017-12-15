@@ -36,7 +36,7 @@ end
 # auxiliary functions
 pkguuid(p::String) = uuid5(uuid_package, p)
 function storeuuid(p::String, uuid_to_name::Dict{UUID,String})
-    uuid = pkguuid(p)
+    uuid = p == "julia" ? Types.uuid_julia : pkguuid(p)
     if haskey(uuid_to_name, uuid)
         @assert uuid_to_name[uuid] == p
     else
@@ -185,7 +185,7 @@ function resolve_tst(deps_data, reqs_data, want_data = nothing)
     println()
     deps = deps_from_data(deps_data)
     reqs = reqs_from_data(reqs_data, deps)
-    add_reqs!(deps, reqs, explicit=true)
+    add_reqs!(deps, reqs)
 
     simplify_graph!(deps)
     want = resolve(deps)

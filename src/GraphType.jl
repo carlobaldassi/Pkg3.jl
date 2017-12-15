@@ -8,6 +8,27 @@ import Pkg3.equalto
 
 export NewGraph, add_reqs!, add_fixed!, simplify_graph!
 
+# This is used to keep track of dependency relations when propagating
+# requirements, so as to emit useful information in case of unsatisfiable
+# conditions.
+# The `why` field is a Vector which keeps track of the requirements. Each
+# entry is a Tuple of two elements:
+# 1) the first element is the reason, and it can be either :fixed (for
+#    fixed packages), :explicit_requirement (for explicitly required packages),
+#    or a Tuple `(:constr_prop, p, backtrace_item)` (for requirements induced
+#    indirectly), where `p` is the package index and `backtrace_item` is
+#    another NewResolveBacktraceItem.
+# 2) the second element is a BitVector representing the requirement as a mask
+#    over the possible states of the package
+mutable struct NewResolveBacktraceItem
+    why::Vector{Any}
+    NewResolveBacktraceItem() = new(Any[])
+end
+
+function Base.push!(ritem::NewResolveBacktraceItem, reason, versionmask)
+    push!(ritem.why, (reason, versionmask))
+end
+
 mutable struct GraphData
     # packages list
     pkgs::Vector{UUID}
@@ -129,6 +150,9 @@ mutable struct NewGraph
     # states per package: same as in GraphData
     spp::Vector{Int}
 
+    # backtrace: keep track of the resolution process
+    bktrc::Vector{NewResolveBacktraceItem}
+
     # number of packages (all Vectors above have this length)
     np::Int
 
@@ -230,10 +254,12 @@ mutable struct NewGraph
         req_inds = Set{Int}()
         fix_inds = Set{Int}()
 
-        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, np)
+        bktrc = [NewResolveBacktraceItem() for p0 = 1:np]
 
-        add_reqs!(graph, reqs, explicit = true)
-        add_fixed!(graph, fixed)
+        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, bktrc, np)
+
+        _add_reqs!(graph, reqs, :explicit_requirement)
+        _add_fixed!(graph, fixed)
 
         @assert check_consistency(graph)
         check_constraints(graph)
@@ -243,37 +269,53 @@ mutable struct NewGraph
 end
 
 """
-Add requirements to the graph, implemented as constraints.
-The `explicit` keyword indicates whether these are considered user-defined
-requirements, and are thus prioritized by the solver.
+Add explicit requirements to the graph.
 """
-function add_reqs!(graph::NewGraph, reqs::Requires; explicit::Bool = false)
+function add_reqs!(graph::NewGraph, reqs::Requires)
+    _add_reqs!(graph, reqs, :explicit_requirement)
+    check_constraints(graph)
+    # TODO: add reqs to graph data?
+    return graph
+end
+
+function _add_reqs!(graph::NewGraph, reqs::Requires, reason)
     gconstr = graph.gconstr
     spp = graph.spp
     req_inds = graph.req_inds
+    bktrc = graph.bktrc
     pdict = graph.data.pdict
     pvers = graph.data.pvers
 
     for (rp,rvs) in reqs
         haskey(pdict, rp) || error("unknown required package $(pkgID(rp, graph))")
         rp0 = pdict[rp]
-        gconstr0 = gconstr[rp0]
-        gconstr0[end] = false
+        new_constr = trues(spp[rp0])
         for rv0 = 1:(spp[rp0]-1)
             rvn = pvers[rp0][rv0]
-            rvn ∈ rvs || (gconstr0[rv0] = false)
+            rvn ∈ rvs || (new_constr[rv0] = false)
         end
-        explicit && push!(req_inds, rp0)
+        new_constr[end] = false
+        old_constr = copy(gconstr[rp0])
+        gconstr[rp0] .&= new_constr
+        reason ≡ :explicit_requirement && push!(req_inds, rp0)
+        old_constr ≠ gconstr[rp0] && push!(bktrc[rp0], reason, new_constr)
     end
-    # TODO: add reqs in GraphData
     return graph
 end
 
-"Add fixed packages to the graph, implemented as constraints, and their requirements."
+"Add fixed packages to the graph, and their requirements."
 function add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
+    _add_fixed!(graph, fixed)
+    check_constraints(graph)
+    # TODO: add fixed to graph data?
+    return graph
+end
+
+function _add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
     gconstr = graph.gconstr
     spp = graph.spp
     fix_inds = graph.fix_inds
+    bktrc = graph.bktrc
     pdict = graph.data.pdict
     vdict = graph.data.vdict
 
@@ -281,19 +323,18 @@ function add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
         haskey(pdict, fp) || error("unknown fixed package $(pkgID(fp, graph))")
         fp0 = pdict[fp]
         fv0 = vdict[fp0][fx.version]
-        # disable all versions, but keep the fixed one as-is
-        # (allows to detect contradicions with requirements)
-        old_constr = gconstr[fp0][fv0]
-        fill!(gconstr[fp0], false)
-        gconstr[fp0][fv0] = old_constr
+        new_constr = falses(spp[fp0])
+        new_constr[fv0] = true
+        gconstr[fp0] .&= new_constr
         push!(fix_inds, fp0)
-        add_reqs!(graph, fx.requires)
+        push!(bktrc[fp0], :fixed, new_constr)
+        _add_reqs!(graph, fx.requires, (:constr_prop, fp0, bktrc[fp0]))
     end
-    # TODO: add fixed in GraphData
     return graph
 end
 
 Types.pkgID(p::UUID, graph::NewGraph) = pkgID(p, graph.data.uuid_to_name)
+Types.pkgID(p0::Int, graph::NewGraph) = pkgID(graph.data.pkgs[p0], graph)
 
 function check_consistency(graph::NewGraph)
     np = graph.np
@@ -305,6 +346,7 @@ function check_consistency(graph::NewGraph)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
+    bktrc = graph.bktrc
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
@@ -313,7 +355,7 @@ function check_consistency(graph::NewGraph)
     pruned = data.pruned
 
     @assert np ≥ 0
-    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, pkgs, pdict, pvers, vdict]
+    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, bktrc, pkgs, pdict, pvers, vdict]
         @assert length(x) == np
     end
     for p0 = 1:np
@@ -366,50 +408,111 @@ function check_consistency(graph::NewGraph)
     return true
 end
 
-# function init_resolve_backtrace(uuid_to_name::Dict{UUID,String}, reqs::Requires, fix::Dict{UUID,Fixed} = Dict{UUID,Fixed}())
-#     bktrc = ResolveBacktrace(uuid_to_name)
-#     for (p,f) in fix
-#         bktrc[p] = ResolveBacktraceItem(:fixed, f.version)
-#     end
-#     for (p,vs) in reqs
-#         bktrcp = get!(bktrc, p) do; ResolveBacktraceItem() end
-#         push!(bktrcp, :required, vs)
-#     end
-#     return bktrc
-# end
+"Show the resolution backtrace for some package"
+function showbacktrace(io::IO, graph::NewGraph, p0::Int)
+    _show(io, graph, p0, graph.bktrc[p0], "", Set{NewResolveBacktraceItem}())
+end
+
+# Show a recursive tree with requirements applied to a package, either directly or indirectly
+function _show(io::IO, graph::NewGraph, p0::Int, ritem::NewResolveBacktraceItem, indent::String, seen::Set{NewResolveBacktraceItem})
+    id0 = pkgID(p0, graph)
+    gconstr = graph.gconstr
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    function vs_string(p0::Int, vmask::BitVector)
+        vns = Vector{Any}(pvers[p0][vmask[1:(end-1)]])
+        vmask[end] && push!(vns, "uninstalled")
+        return join(string.(vns), ", ", " or ")
+    end
+
+    l = length(ritem.why)
+    for (i,(w,vmask)) in enumerate(ritem.why)
+        print(io, indent, (i==l ? '└' : '├'), '─')
+        if w ≡ :fixed
+            @assert count(vmask) == 1
+            println(io, "$id0 is fixed to version ", vs_string(p0, vmask))
+        elseif w ≡ :explicit_requirement
+            @assert !vmask[end]
+            if any(vmask)
+                println(io, "an explicit requirement sets $id0 to versions: ", vs_string(p0, vmask))
+            else
+                println(io, "an explicit requirement cannot be matched by any of the available versions of $id0")
+            end
+        else
+            @assert w isa Tuple{Symbol,Int,NewResolveBacktraceItem}
+            @assert w[1] == :constr_prop
+            p1 = w[2]
+            if !is_current_julia(graph, p1)
+                id1 = pkgID(p1, graph)
+                otheritem = w[3]
+                if any(vmask)
+                    println(io, "the only versions of $id0 compatible with $id1 (whose allowed versions are $(vs_string(p1, gconstr[p1])))\n",
+                                indent, (i==l ? "  " : "│ "),"are these: ", vs_string(p0, vmask))
+                else
+                    println(io, "no versions of $id0 are compatible with $id1 (whose allowed versions are $(vs_string(p1, gconstr[p1])))")
+                end
+                if otheritem ∈ seen
+                    println(io, indent, (i==l ? "  " : "│ "), "└─see above for $id1 backtrace")
+                    continue
+                end
+                push!(seen, otheritem)
+                _show(io, graph, p1, otheritem, indent * (i==l ? "  " : "│ "), seen)
+            else
+                if any(vmask)
+                    println(io, "the only versions of $id0 compatible with julia v$VERSION are these: ", vs_string(p0, vmask))
+                else
+                    println(io, "no versions of $id0 are compatible with julia v$VERSION")
+                end
+            end
+        end
+    end
+end
+
+function is_current_julia(graph::NewGraph, p1::Int)
+    gconstr = graph.gconstr
+    fix_inds = graph.fix_inds
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    (pkgs[p1] == uuid_julia && p1 ∈ fix_inds) || return false
+    jconstr = gconstr[p1]
+    return length(jconstr) == 2 && !jconstr[2] && pvers[p1][1] == VERSION
+end
 
 "Check for contradictions in the constraints."
 function check_constraints(graph::NewGraph)
     np = graph.np
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
 
     id(p0::Int) = pkgID(pkgs[p0], graph)
 
     for p0 = 1:np
-        if !any(gconstr[p0])
-            err_msg = "Unsatisfiable requirements detected for package $(id(p0)):\n"
-            # err_msg *= sprint(showitem, bktrc, p)
-            # err_msg *= """The intersection of the requirements is $(bktrc[p].versionreq).
-            #               None of the available versions can satisfy this requirement."""
-            throw(PkgError(err_msg))
-        end
+        any(gconstr[p0]) && continue
+        err_msg = "Unsatisfiable requirements detected for package $(id(p0)):\n"
+        err_msg *= sprint(showbacktrace, graph, p0)
+        throw(PkgError(err_msg))
     end
     return true
 end
 
 """
 Propagates current constraints, determining new implicit constraints.
-Throws an error in case impossible requirements are detected.
+Throws an error in case impossible requirements are detected, printing
+a backtrace.
 """
 function propagate_constraints!(graph::NewGraph)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
+    bktrc = graph.bktrc
     gconstr = graph.gconstr
     adjdict = graph.adjdict
     pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
 
     id(p0::Int) = pkgID(pkgs[p0], graph)
 
@@ -421,6 +524,9 @@ function propagate_constraints!(graph::NewGraph)
         for p0 in staged
             gconstr0 = gconstr[p0]
             for (j1,p1) in enumerate(gadj[p0])
+                # we don't propagate to julia (purely to have better error messages)
+                is_current_julia(graph, p1) && continue
+
                 msk = gmsk[p0][j1]
                 # consider the sub-mask with only allowed versions of p0
                 sub_msk = msk[:,gconstr0]
@@ -433,16 +539,17 @@ function propagate_constraints!(graph::NewGraph)
                 gconstr1 = gconstr[p1]
                 old_gconstr1 = copy(gconstr1)
                 gconstr1 .&= added_constr1
+                # if the new constraints are more restrictive than the
+                # previous ones, record it and propagate them next
+                if gconstr1 ≠ old_gconstr1
+                    push!(staged_next, p1)
+                    push!(bktrc[p1], (:constr_prop, p0, bktrc[p0]), added_constr1)
+                end
                 if !any(gconstr1)
                     err_msg = "Unsatisfiable requirements detected for package $(id(p1)):\n"
-                    # err_msg *= sprint(showitem, bktrc, p)
-                    # err_msg *= """The intersection of the requirements is $(bktrc[p].versionreq).
-                    #               None of the available versions can satisfy this requirement."""
+                    err_msg *= sprint(showbacktrace, graph, p1)
                     throw(PkgError(err_msg))
                 end
-                # if the new constraints are more restrictive than the
-                # previous ones, propagate them next
-                gconstr1 ≠ old_gconstr1 && push!(staged_next, p1)
             end
         end
         staged = staged_next
@@ -503,6 +610,7 @@ function prune_graph!(graph::NewGraph)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
+    bktrc = graph.bktrc
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
@@ -634,6 +742,10 @@ function prune_graph!(graph::NewGraph)
     end
     new_gmsk = [[compute_gmsk(new_p0, new_j0) for new_j0 = 1:length(new_gadj[new_p0])] for new_p0 = 1:new_np]
 
+    # Clear out resolution backtrace
+    # TODO: save it somehow?
+    new_bktrc = [NewResolveBacktraceItem() for new_p0 = 1:new_np]
+
     # Done
 
     info("""
@@ -662,6 +774,7 @@ function prune_graph!(graph::NewGraph)
     graph.req_inds = new_req_inds
     graph.fix_inds = new_fix_inds
     graph.spp = new_spp
+    graph.bktrc = new_bktrc
     graph.np = new_np
 
     @assert check_consistency(graph)
@@ -681,242 +794,6 @@ function simplify_graph!(graph::NewGraph)
 end
 
 
-# function check_fixed(reqs::Requires, fix::Dict{UUID,Fixed}, graph::NewGraph)
-#     id(p) = pkgID(p, deps)
-#     for (p1,f1) in fix
-#         for p2 in keys(f1.requires)
-#             if !(haskey(graph.data.pkgs, p2) || haskey(fix, p2))
-#                 throw(PkgError("unknown package $(id(p1)) required by $(id(p2))"))
-#             end
-#         end
-#         if !satisfies(p1, f1.version, reqs)
-#             warn("$(id(p1)) is fixed at $(f1.version) conflicting with top-level requirement: $(reqs[p1])")
-#         end
-#         for (p2,f2) in fix
-#             if !satisfies(p1, f1.version, f2.requires)
-#                 warn("$(id(p1)) is fixed at $(f1.version) conflicting with requirement for $(id(p2)): $(f2.requires[p1])")
-#             end
-#         end
-#     end
-# end
-#
-# function propagate_fixed!(reqs::Requires, bktrc::ResolveBacktrace, fix::Dict{UUID,Fixed})
-#     for (p,f) in fix
-#         merge_requires!(reqs, f.requires)
-#         for (rp,rvs) in f.requires
-#             bktrc_rp = get!(bktrc, rp) do; ResolveBacktraceItem() end
-#             push!(bktrc_rp, p=>bktrc[p], rvs)
-#         end
-#     end
-#     for (p,f) in fix
-#         delete!(reqs, p)
-#     end
-#     reqs
-# end
-#
-# # Generate a reverse dependency graph (package names only)
-# function gen_backdeps(deps::DepsGraph)
-#     backdeps = Dict{UUID,Set{UUID}}()
-#     for (p,depsp) in deps, (vn,vdep) in depsp, rp in keys(vdep)
-#         s = get!(backdeps, rp) do; Set{UUID}() end
-#         push!(s, p)
-#     end
-#     return backdeps
-# end
-#
-# function dependencies(graph::NewGraph, fix::Dict = Dict{UUID,Fixed}(uuid_julia=>Fixed(VERSION)))
-#     np = graph.np
-#     spp = graph.spp
-#     gadj = graph.gadj
-#     gmsk = graph.gmsk
-#     adjdict = graph.adjdict
-#     pkgs = graph.data.pkgs
-#     pdict = graph.data.pdict
-#     vdict = graph.data.vdict
-#
-#     conflicts = Dict{UUID,Set{UUID}}()
-#     vers_to_expunge = [falses(spp[p0]-1) for p0 = 1:np]
-#     links_to_expunge = [Int[] for p0 = 1:np]
-#     emptied = Int[]
-#
-#
-#     for (fp,fx) in fix
-#         delete!(deps, fp)
-#         fp0 = pdict[fp]         # TODO: make sure that fix always appear in the graph?
-#         fv0 = vdict[fx.version]
-#
-#         for (j1,p1) in gadj[fp0]
-#             to_expunge = .~(gmsk[fp0][j1][1:(end-1),fv0]) # mask of incompatible versions of p1
-#
-#             if any(to_expunge)
-#                 conflicts_p = get!(conflicts, pkgs[p1]) do; Set{UUID}() end
-#                 push!(conflicts_p, fp)
-#                 vers_to_expunge[p1] .|= to_expunge
-#                 all(vers_to_expunge[p1]) && push(emptied, p1)
-#             else
-#                 push!(links_to_expunge[p1], adjdict[p1][fp0])
-#                 push!(links_to_expunge[fp0], j1)
-#             end
-#             isempty(depsp) && push!(emptied, p)
-#         end
-#     end
-#     # XXX ...
-#
-#     while !isempty(emptied)
-#         deleted_pkgs = UUID[]
-#         for p in emptied
-#             delete!(deps, p)
-#             push!(deleted_pkgs, p)
-#         end
-#         empty!(emptied)
-#
-#         for dp in deleted_pkgs
-#             haskey(backdeps, dp) || continue
-#             for p in backdeps[dp]
-#                 haskey(deps, p) || continue
-#                 depsp = deps[p]
-#                 empty!(to_expunge)
-#                 for (vn,vdep) in depsp
-#                     haskey(vdep, dp) || continue
-#                     conflicts_p = get!(conflicts, p) do; Set{UUID}() end
-#                     union!(conflicts_p, conflicts[dp])
-#                     push!(to_expunge, vn)
-#                 end
-#                 for vn in to_expunge
-#                     delete!(depsp, vn)
-#                 end
-#                 isempty(depsp) && push!(emptied, p)
-#             end
-#         end
-#     end
-#     deps, conflicts
-# end
-#
-# function check_requirements(reqs::Requires, deps::DepsGraph, fix::Dict{UUID,Fixed})
-#     id(p) = pkgID(p, deps)
-#     for (p,vs) in reqs
-#         any(vn->(vn ∈ vs), keys(deps[p])) && continue
-#         remaining_vs = VersionSpec()
-#         err_msg = "fixed packages introduce conflicting requirements for $(id(p)): \n"
-#         available_list = sort!(collect(keys(deps[p])))
-#         for (p1,f1) in fix
-#             f1r = f1.requires
-#             haskey(f1r, p) || continue
-#             err_msg *= "         $(id(p1)) requires versions $(f1r[p])"
-#             if !any([vn in f1r[p] for vn in available_list])
-#                 err_msg *= " [none of the available versions can satisfy this requirement]"
-#             end
-#             err_msg *= "\n"
-#             remaining_vs = intersect(remaining_vs, f1r[p])
-#         end
-#         if isempty(remaining_vs)
-#             err_msg *= "       the requirements are unsatisfiable because their intersection is empty"
-#         else
-#             err_msg *= "       available versions are $(join(available_list, ", ", " and "))"
-#         end
-#         throw(PkgError(err_msg))
-#     end
-# end
-#
-# # If there are explicitly required packages, dicards all versions outside
-# # the allowed range.
-# # It also propagates requirements: when all allowed versions of a required package
-# # require some other package, this creates a new implicit requirement.
-# # The propagation is tracked so that in case a contradiction is detected the error
-# # message allows to determine the cause.
-# # This is a pre-pruning step, so it also creates some structures which are later used by pruning
-# function filter_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace)
-#     id(p) = pkgID(p, deps)
-#     allowed = Dict{UUID,Dict{VersionNumber,Bool}}()
-#     staged = copy(reqs)
-#     while !isempty(staged)
-#         staged_next = Requires()
-#         for (p,vs) in staged
-#             # Parse requirements and store allowed versions.
-#             depsp = deps[p]
-#             if !haskey(allowed, p)
-#                 allowedp = Dict{VersionNumber,Bool}(vn=>true for vn in keys(depsp))
-#                 allowed[p] = allowedp
-#                 seen = false
-#             else
-#                 allowedp = allowed[p]
-#                 oldallowedp = copy(allowedp)
-#                 seen = true
-#             end
-#             for vn in keys(depsp)
-#                 allowedp[vn] &= vn ∈ vs
-#             end
-#             @assert !isempty(allowedp)
-#             if !any(values(allowedp))
-#                 err_msg = "Unsatisfiable requirements detected for package $(id(p)):\n"
-#                 err_msg *= sprint(showitem, bktrc, p)
-#                 err_msg *= """The intersection of the requirements is $(bktrc[p].versionreq).
-#                               None of the available versions can satisfy this requirement."""
-#                 throw(PkgError(err_msg))
-#             end
-#
-#             # If we've seen this package already and nothing has changed since
-#             # the last time, we stop here.
-#             seen && allowedp == oldallowedp && continue
-#
-#             # Propagate requirements:
-#             # if all allowed versions of a required package require some other package,
-#             # then compute the union of the allowed versions for that other package, and
-#             # treat that as a new requirement.
-#             # Start by filtering out the non-allowed versions
-#             fdepsp = Dict{VersionNumber,Requires}(vn=>depsp[vn] for vn in keys(depsp) if allowedp[vn])
-#             # Collect all required packages
-#             isreq = Dict{UUID,Bool}(rp=>true for vdep in values(fdepsp) for rp in keys(vdep))
-#             # Compute whether a required package appears in all requirements
-#             for rp in keys(isreq)
-#                 isreq[rp] = all(haskey(vdep, rp) for vdep in values(fdepsp))
-#             end
-#
-#             # Create a list of candidates for new implicit requirements
-#             staged_new = Set{UUID}()
-#             for vdep in values(fdepsp), (rp,rvs) in vdep
-#                 # Skip packages that may not be required
-#                 isreq[rp] || continue
-#                 # Compute the union of the version sets
-#                 if haskey(staged_next, rp)
-#                     snvs = staged_next[rp]
-#                     union!(snvs, rvs)
-#                 else
-#                     snvs = copy(rvs)
-#                     staged_next[rp] = snvs
-#                 end
-#                 push!(staged_new, rp)
-#             end
-#             for rp in staged_new
-#                 @assert isreq[rp]
-#                 srvs = staged_next[rp]
-#                 bktrcp = get!(bktrc, rp) do; ResolveBacktraceItem(); end
-#                 push!(bktrcp, p=>bktrc[p], srvs)
-#                 if isa(bktrcp.versionreq, VersionSpec) && isempty(bktrcp.versionreq)
-#                     err_msg = "Unsatisfiable requirements detected for package $(id(rp)):\n"
-#                     err_msg *= sprint(showitem, bktrc, rp)
-#                     err_msg *= "The intersection of the requirements is empty."
-#                     throw(PkgError(err_msg))
-#                 end
-#             end
-#         end
-#         staged = staged_next
-#     end
-#
-#     filtered_deps = DepsGraph(deps.uuid_to_name)
-#     for (p,depsp) in deps
-#         filtered_deps[p] = Dict{VersionNumber,Requires}()
-#         allowedp = get(allowed, p) do; Dict{VersionNumber,Bool}() end
-#         fdepsp = filtered_deps[p]
-#         for (vn,vdep) in depsp
-#             get(allowedp, vn, true) || continue
-#             fdepsp[vn] = vdep
-#         end
-#     end
-#
-#     return filtered_deps, allowed
-# end
-#
 # # Reduce the number of versions by creating equivalence classes, and retaining
 # # only the highest version for each equivalence class.
 # # Two versions are equivalent if:
@@ -924,7 +801,7 @@ end
 # #      dependency relation, they are both required or both not required)
 # #   2) They have the same dependencies
 # # Preliminarily calls filter_versions.
-# function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::ResolveBacktrace)
+# function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::NewResolveBacktrace)
 #     filtered_deps, allowed = filter_versions(reqs, deps, bktrc)
 #     if !isempty(reqs)
 #         filtered_deps = dependencies_subset(filtered_deps, Set{UUID}(keys(reqs)))
@@ -1072,7 +949,7 @@ end
 #     return new_deps, eq_classes
 # end
 # prune_versions(deps::DepsGraph) =
-#     prune_versions(Requires(), deps, ResolveBacktrace(deps.uuid_to_name))
+#     prune_versions(Requires(), deps, NewResolveBacktrace(deps.uuid_to_name))
 #
 # # Build a graph restricted to a subset of the packages
 # function subdeps(deps::DepsGraph, pkgs::Set{UUID})
@@ -1133,7 +1010,7 @@ end
 # end
 #
 # function prune_dependencies(reqs::Requires, deps::DepsGraph,
-#                             bktrc::ResolveBacktrace = init_resolve_backtrace(deps.uuid_to_name, reqs))
+#                             bktrc::NewResolveBacktrace = init_resolve_backtrace(deps.uuid_to_name, reqs))
 #     deps, _ = prune_versions(reqs, deps, bktrc)
 #     return deps
 # end
