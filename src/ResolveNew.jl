@@ -6,6 +6,7 @@ include(joinpath("resolve", "VersionWeights.jl"))
 include(joinpath("resolve", "MaxSumNew.jl"))
 
 using ..Types
+using ..GraphType
 using .MaxSum
 import ..Types: uuid_julia
 
@@ -19,6 +20,8 @@ function resolve(graph::NewGraph)
     ok, sol = greedysolver(graph)
 
     ok && @goto solved
+
+    info("greedy failed")
 
     # trivial solution failed, use maxsum solver
     msgs = Messages(graph)
@@ -47,6 +50,8 @@ function resolve(graph::NewGraph)
         ## info("ERROR MESSAGE:\n" * msg)
         throw(PkgError(msg))
     end
+
+    info("maxsum succeeded")
 
     # verify solution (debug code) and enforce its optimality
     @assert verify_solution(sol, graph)
@@ -163,17 +168,24 @@ end
 
 # The output format is a Dict which associates a VersionNumber to each installed package name
 function compute_output_dict(sol::Vector{Int}, graph::NewGraph)
-    pkgs = graph.data.pkgs
     np = graph.np
-    pvers = graph.data.pvers
     spp = graph.spp
+    fix_inds = graph.fix_inds
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+    pruned = graph.data.pruned
 
     want = Dict{UUID,VersionNumber}()
     for p0 = 1:np
+        p0 ∈ fix_inds && continue
         p = pkgs[p0]
         s0 = sol[p0]
         s0 == spp[p0] && continue
         vn = pvers[p0][s0]
+        want[p] = vn
+    end
+    for (p,vn) in pruned
+        @assert !haskey(want, p)
         want[p] = vn
     end
 

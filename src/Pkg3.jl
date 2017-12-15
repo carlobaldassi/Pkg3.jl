@@ -42,6 +42,7 @@ include("../ext/TOML/src/TOML.jl")
 include("../ext/TerminalMenus/src/TerminalMenus.jl")
 
 include("Types.jl")
+include("GraphType.jl")
 include("Query.jl")
 include("Resolve.jl")
 include("ResolveNew.jl")

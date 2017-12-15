@@ -2,7 +2,7 @@ module Operations
 
 using Base.Random: UUID
 using Base: LibGit2
-using Pkg3: TerminalMenus, Types, Query, Resolve, ResolveNew
+using Pkg3: TerminalMenus, Types, GraphType, Query, Resolve, ResolveNew
 import Pkg3: GLOBAL_SETTINGS, depots, BinaryProvider
 import Pkg3.Types: uuid_julia
 
@@ -252,9 +252,8 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     end
     deps = Query.prune_dependencies(reqs, deps)
     vers = Resolve.resolve(reqs, deps)
+    simplify_graph!(deps_new)
     vers_new = ResolveNew.resolve(deps_new)
-    @assert get(vers_new, uuid_julia, nothing) == VERSION
-    delete!(vers_new, uuid_julia)
     @assert vers == vers_new
     find_registered!(env, collect(keys(vers)))
     # update vector of package versions

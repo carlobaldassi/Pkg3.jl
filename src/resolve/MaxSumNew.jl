@@ -4,7 +4,7 @@ module MaxSum
 
 include("FieldValues.jl")
 
-using .FieldValues, ..VersionWeights, ...Types
+using .FieldValues, ..VersionWeights, ...Types, ...GraphType
 
 export UnsatError, Messages, maxsum
 
@@ -162,7 +162,7 @@ function update(p0::Int, graph::NewGraph, msgs::Messages)
         # compute the output cavity message p0->p1
         cavmsg = fld0 - msg0[j0]
 
-        if dir1 == Types.BACKWARDS
+        if dir1 == GraphType.BACKWARDS
             # p0 depends on p1
             for v0 = 1:spp0-1
                 cavmsg[v0] += FieldValue(0, VersionWeight(0), VersionWeight(0), 0, v0)
@@ -187,7 +187,7 @@ function update(p0::Int, graph::NewGraph, msgs::Messages)
                     newmsg[v1] = max(newmsg[v1], cavmsg[v0])
                 end
             end
-            if dir1 == Types.FORWARD && v1 != spp1
+            if dir1 == GraphType.FORWARD && v1 != spp1
                 # p1 depends on p0
                 newmsg[v1] += FieldValue(0, VersionWeight(0), VersionWeight(0), 0, v1)
             end
