@@ -621,19 +621,20 @@ Reduce the number of versions in the graph by putting all the versions of
 a package that behave identically into equivalence classes, keeping only
 the highest version of the class as representative.
 """
-function build_eq_classes!(graph::NewGraph)
+function compute_eq_classes!(graph::NewGraph; verbose::Bool = false)
     np = graph.np
-    info("Creating equivalence classes")
     sumspp = sum(graph.spp)
     for p0 = 1:np
         build_eq_classes1!(graph, p0)
     end
 
-    info("""
-         EQ CLASSES STATS:
-           before: $(sumspp)
-           after:  $(sum(graph.spp))
-           """)
+    if verbose
+        info("""
+             EQ CLASSES STATS:
+               before: $(sumspp)
+               after:  $(sum(graph.spp))
+             """)
+    end
 
     # wipe out backtrace because it doesn't make sense now
     # TODO: save it somehow?
@@ -715,7 +716,7 @@ end
 Prune away fixed and unnecessary packages, and the
 disallowed versions for the remaining packages.
 """
-function prune_graph!(graph::NewGraph)
+function prune_graph!(graph::NewGraph; verbose::Bool = false)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -732,8 +733,6 @@ function prune_graph!(graph::NewGraph)
     pvers = data.pvers
     vdict = data.vdict
     pruned = data.pruned
-
-    info("Simplifying")
 
     # We will remove all packages that only have one allowed state
     # (includes fixed packages and forbidden packages)
@@ -778,9 +777,6 @@ function prune_graph!(graph::NewGraph)
     # Update packages records
     new_pkgs = pkgs[pkg_mask]
     new_pdict = Dict(new_pkgs[new_p0]=>new_p0 for new_p0 = 1:new_np)
-
-    # println("  old_pkgs = ", map(u->data.uuid_to_name[u], pkgs))
-    # println("  new_pkgs = ", map(u->data.uuid_to_name[u], new_pkgs))
 
     # For each package (unless it's going to be pruned) we will remove all
     # versions that aren't allowed (but not the "uninstalled" state)
@@ -863,11 +859,13 @@ function prune_graph!(graph::NewGraph)
 
     # Done
 
-    info("""
-         PRUNING STATS:
-           before: np = $np ⟨spp⟩ = $(mean(spp))
-           after:  np = $new_np ⟨spp⟩ = $(mean(new_spp))
-        """)
+    if verbose
+        info("""
+             GRAPH SIMPLIFY STATS:
+               before: np = $np ⟨spp⟩ = $(mean(spp))
+               after:  np = $new_np ⟨spp⟩ = $(mean(new_spp))
+             """)
+    end
 
     # Replace old data with new
     data.pkgs = new_pkgs
@@ -898,14 +896,14 @@ function prune_graph!(graph::NewGraph)
 end
 
 """
-Simplifies the graph by propagating constraints, disabling unreachable versions and
-then pruning.
+Simplifies the graph by propagating constraints, disabling unreachable versions, pruning
+and grouping versions into equivalence classes.
 """
-function simplify_graph!(graph::NewGraph, sources::Set{Int} = Set{Int}())
+function simplify_graph!(graph::NewGraph, sources::Set{Int} = Set{Int}(); verbose::Bool = false)
     propagate_constraints!(graph)
     disable_unreachable!(graph, sources)
-    prune_graph!(graph)
-    build_eq_classes!(graph)
+    prune_graph!(graph, verbose = verbose)
+    compute_eq_classes!(graph, verbose = verbose)
     return graph
 end
 

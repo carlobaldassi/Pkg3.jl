@@ -11,6 +11,9 @@ using Pkg3.ResolveNew
 using Pkg3.ResolveNew.VersionWeights
 import Pkg3.Types: uuid5, uuid_package
 
+# print info, stats etc.
+const VERBOSE = false
+
 # Check that VersionWeight keeps the same ordering as VersionNumber
 
 vlst = [
@@ -164,9 +167,13 @@ end
 function sanity_tst(deps_data, expected_result; pkgs=[])
     deps = deps_from_data(deps_data)
     id(p) = pkgID(pkguuid(p), deps)
-    #println("deps=$deps")
-    #println()
-    result = sanity_check(deps, Set(pkguuid(p) for p in pkgs))
+    if VERBOSE
+        println()
+        info("sanity check")
+        @show deps_data
+        @show pkgs
+    end
+    result = sanity_check(deps, Set(pkguuid(p) for p in pkgs), verbose = VERBOSE)
 
     length(result) == length(expected_result) || return false
     expected_result_uuid = [(id(p), vn) for (p,vn) in expected_result]
@@ -178,22 +185,23 @@ end
 sanity_tst(deps_data; kw...) = sanity_tst(deps_data, []; kw...)
 
 function resolve_tst(deps_data, reqs_data, want_data = nothing)
-    println()
-    info("resolving")
-    @show deps_data
-    @show reqs_data
-    println()
+    if VERBOSE
+        println()
+        info("resolving")
+        @show deps_data
+        @show reqs_data
+    end
     deps = deps_from_data(deps_data)
     reqs = reqs_from_data(reqs_data, deps)
     add_reqs!(deps, reqs)
 
-    simplify_graph!(deps)
-    want = resolve(deps)
+    simplify_graph!(deps, verbose = VERBOSE)
+    want = resolve(deps, verbose = VERBOSE)
 
     return want == wantuuids(want_data)
 end
 
-info("SCHEME 1")
+VERBOSE && info("SCHEME 1")
 ## DEPENDENCY SCHEME 1: TWO PACKAGES, DAG
 deps_data = Any[
     ["A", v"1", "B", "1-*"],
@@ -224,7 +232,7 @@ want_data = Dict("A"=>v"2", "B"=>v"2")
 @test resolve_tst(deps_data, reqs_data, want_data)
 
 
-info("SCHEME 2")
+VERBOSE && info("SCHEME 2")
 ## DEPENDENCY SCHEME 2: TWO PACKAGES, CYCLIC
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -257,7 +265,7 @@ want_data = Dict("A"=>v"1", "B"=>v"2")
 @test resolve_tst(deps_data, reqs_data, want_data)
 
 
-info("SCHEME 3")
+VERBOSE && info("SCHEME 3")
 ## DEPENDENCY SCHEME 3: THREE PACKAGES, CYCLIC, TWO MUTUALLY EXCLUSIVE SOLUTIONS
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -299,7 +307,7 @@ reqs_data = Any[
 @test_throws PkgError resolve_tst(deps_data, reqs_data)
 
 
-info("SCHEME 4")
+VERBOSE && info("SCHEME 4")
 ## DEPENDENCY SCHEME 4: TWO PACKAGES, DAG, WITH TRIVIAL INCONSISTENCY
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -317,7 +325,7 @@ want_data = Dict("B"=>v"1")
 @test resolve_tst(deps_data, reqs_data, want_data)
 
 
-info("SCHEME 5")
+VERBOSE && info("SCHEME 5")
 ## DEPENDENCY SCHEME 5: THREE PACKAGES, DAG, WITH IMPLICIT INCONSISTENCY
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -348,7 +356,7 @@ reqs_data = Any[
 @test_throws PkgError resolve_tst(deps_data, reqs_data)
 
 
-info("SCHEME 6")
+VERBOSE && info("SCHEME 6")
 ## DEPENDENCY SCHEME 6: TWO PACKAGES, CYCLIC, TOTALLY INCONSISTENT
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -373,7 +381,7 @@ reqs_data = Any[
 @test_throws PkgError resolve_tst(deps_data, reqs_data)
 
 
-info("SCHEME 7")
+VERBOSE && info("SCHEME 7")
 ## DEPENDENCY SCHEME 7: THREE PACKAGES, CYCLIC, WITH INCONSISTENCY
 deps_data = Any[
     ["A", v"1", "B", "1"],
@@ -408,7 +416,7 @@ reqs_data = Any[
 @test_throws PkgError resolve_tst(deps_data, reqs_data)
 
 
-info("SCHEME 8")
+VERBOSE && info("SCHEME 8")
 ## DEPENDENCY SCHEME 8: THREE PACKAGES, CYCLIC, TOTALLY INCONSISTENT
 deps_data = Any[
     ["A", v"1", "B", "1"],
@@ -441,7 +449,7 @@ reqs_data = Any[
 ]
 @test_throws PkgError resolve_tst(deps_data, reqs_data)
 
-info("SCHEME 9")
+VERBOSE && info("SCHEME 9")
 ## DEPENDENCY SCHEME 9: SIX PACKAGES, DAG
 deps_data = Any[
     ["A", v"1"],
@@ -505,7 +513,7 @@ want_data = Dict("A"=>v"2", "B"=>v"2", "C"=>v"1",
                  "D"=>v"2", "E"=>v"1", "F"=>v"1")
 @test resolve_tst(deps_data, reqs_data, want_data)
 
-info("SCHEME 10")
+VERBOSE && info("SCHEME 10")
 ## DEPENDENCY SCHEME 10: FIVE PACKAGES, SAME AS SCHEMES 5 + 1, UNCONNECTED
 deps_data = Any[
     ["A", v"1", "B", "2-*"],
@@ -551,7 +559,7 @@ reqs_data = Any[
 want_data = Dict("A"=>v"1", "B"=>v"2", "C"=>v"2", "D"=>v"2", "E"=>v"2")
 @test resolve_tst(deps_data, reqs_data, want_data)
 
-info("SCHEME 11")
+VERBOSE && info("SCHEME 11")
 ## DEPENDENCY SCHEME 11: A REALISTIC EXAMPLE
 ## ref issue #21485
 

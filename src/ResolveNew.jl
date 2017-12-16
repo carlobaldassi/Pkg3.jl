@@ -13,8 +13,8 @@ import ..GraphType: is_current_julia
 
 export resolve, sanity_check
 
-# Use the max-sum algorithm to resolve packages dependencies
-function resolve(graph::NewGraph)
+"Resolve package dependencies."
+function resolve(graph::NewGraph; verbose::Bool = false)
     id(p) = pkgID(p, graph)
 
     # attempt trivial solution first
@@ -22,7 +22,7 @@ function resolve(graph::NewGraph)
 
     ok && @goto solved
 
-    info("greedy failed")
+    verbose && info("resolve: greedy failed")
 
     # trivial solution failed, use maxsum solver
     msgs = Messages(graph)
@@ -31,6 +31,7 @@ function resolve(graph::NewGraph)
         sol = maxsum(graph, msgs)
     catch err
         isa(err, UnsatError) || rethrow(err)
+        verbose && info("resolve: maxsum failed")
         p = graph.data.pkgs[err.info]
         # TODO: build tools to analyze the problem, and suggest to use them here.
         msg =
@@ -52,20 +53,23 @@ function resolve(graph::NewGraph)
         throw(PkgError(msg))
     end
 
-    info("maxsum succeeded")
-
     # verify solution (debug code) and enforce its optimality
     @assert verify_solution(sol, graph)
     enforce_optimality!(sol, graph)
 
     @label solved
 
+    verbose && info("resolve: succeeded")
+
     # return the solution as a Dict mapping UUID => VersionNumber
     return compute_output_dict(sol, graph)
 end
 
-# Scan dependencies for (explicit or implicit) contradictions
-function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}())
+"""
+Scan the graph for (explicit or implicit) contradictions. Returns a list of problematic
+(package,version) combinations.
+"""
+function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}(); verbose::Bool = false)
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
 
@@ -84,7 +88,7 @@ function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}())
         Set{Int}(1:graph.np) :
         Set{Int}(graph.data.pdict[p] for p in sources)
 
-    simplify_graph!(graph, isources)
+    simplify_graph!(graph, isources, verbose = verbose)
 
     np = graph.np
     spp = graph.spp
@@ -118,7 +122,7 @@ function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}())
         add_reqs!(sub_graph, req)
 
         try
-            simplify_graph!(sub_graph)
+            simplify_graph!(sub_graph, verbose = verbose)
         catch err
             isa(err, PkgError) || rethrow(err)
             ## info("ERROR MESSAGE:\n" * err.msg)
@@ -161,7 +165,10 @@ function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}())
     return sort!(problematic)
 end
 
-# The output format is a Dict which associates a VersionNumber to each installed package UUID
+"""
+Translate the solver output (a Vector{Int} of package states) into a Dict which
+associates a VersionNumber to each installed package UUID.
+"""
 function compute_output_dict(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
     spp = graph.spp
@@ -187,8 +194,10 @@ function compute_output_dict(sol::Vector{Int}, graph::NewGraph)
     return want
 end
 
-# Produce a trivial solution: try to maximize each version;
-# bail out as soon as some non-trivial requirements are detected.
+"""
+Preliminary solver attempt: tries to maximize each version; bails out as soon as
+some non-trivial requirement is detected.
+"""
 function greedysolver(graph::NewGraph)
     spp = graph.spp
     gadj = graph.gadj
@@ -251,8 +260,10 @@ function greedysolver(graph::NewGraph)
     return true, sol
 end
 
-# verifies that the solution fulfills all hard constraints
-# (requirements and dependencies)
+"""
+Verifies that the solver solution fulfills all hard constraints
+(requirements and dependencies). This is intended as debug code.
+"""
 function verify_solution(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
     spp = graph.spp
@@ -273,7 +284,12 @@ function verify_solution(sol::Vector{Int}, graph::NewGraph)
     return true
 end
 
-# Push the given solution to a local optimium if needed
+"""
+Push the given solution to a local optimium if needed: keeps increasing
+the states of the given solution as long as no constraints are violated.
+It also removes unnecessary parts of the solution which are unconnected
+to the required packages.
+"""
 function enforce_optimality!(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
     spp = graph.spp
@@ -312,7 +328,9 @@ function enforce_optimality!(sol::Vector{Int}, graph::NewGraph)
 
     # Finally uninstall unneeded packages:
     # start from the required ones and keep only
-    # the packages reachable from them along the graph
+    # the packages reachable from them along the graph.
+    # (These should have been removed in the previous step, but in principle
+    # an unconnected yet self-sustaining cycle may have survived.)
     uninst = trues(np)
     staged = Set{Int}(p0 for p0 = 1:np if !gconstr[p0][end])
     seen = copy(staged)
