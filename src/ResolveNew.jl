@@ -9,6 +9,7 @@ using ..Types
 using ..GraphType
 using .MaxSum
 import ..Types: uuid_julia
+import ..GraphType: is_current_julia
 
 export resolve, sanity_check
 
@@ -64,109 +65,103 @@ function resolve(graph::NewGraph)
 end
 
 # Scan dependencies for (explicit or implicit) contradictions
-# function sanity_check(deps::DepsGraph, pkgs::Set{UUID} = Set{UUID}())
-#     id(p) = pkgID(p, deps)
-#
-#     isempty(pkgs) || (deps = Query.undirected_dependencies_subset(deps, pkgs))
-#
-#     deps, eq_classes = Query.prune_versions(deps)
-#
-#     ndeps = Dict{UUID,Dict{VersionNumber,Int}}()
-#
-#     for (p,depsp) in deps
-#         ndeps[p] = ndepsp = Dict{VersionNumber,Int}()
-#         for (vn,vdep) in depsp
-#             ndepsp[vn] = length(vdep)
-#         end
-#     end
-#
-#     vers = [(p,vn) for (p,depsp) in deps for vn in keys(depsp)]
-#     sort!(vers, by=pvn->(-ndeps[pvn[1]][pvn[2]]))
-#
-#     nv = length(vers)
-#
-#     svdict = Dict{Tuple{UUID,VersionNumber},Int}(vers[i][1:2]=>i for i = 1:nv)
-#
-#     checked = falses(nv)
-#
-#     problematic = Tuple{String,VersionNumber,String}[]
-#     i = 1
-#     for (p,vn) in vers
-#         ndeps[p][vn] == 0 && break
-#         checked[i] && (i += 1; continue)
-#
-#         fixed = Dict{UUID,Fixed}(p=>Fixed(vn, deps[p][vn]), uuid_julia=>Fixed(VERSION))
-#         sub_reqs = Requires()
-#         bktrc = Query.init_resolve_backtrace(deps.uuid_to_name, sub_reqs, fixed)
-#         Query.propagate_fixed!(sub_reqs, bktrc, fixed)
-#         sub_deps = Query.dependencies_subset(deps, Set{UUID}([p]))
-#         sub_deps, conflicts = Query.dependencies(sub_deps, fixed)
-#
-#         try
-#             for rp in keys(sub_reqs)
-#                 haskey(sub_deps, rp) && continue
-#                 if uuid_julia in conflicts[rp]
-#                     throw(PkgError("$(id(rp)) can't be installed because it has no versions that support $VERSION " *
-#                        "of julia. You may need to update METADATA by running `Pkg.update()`"))
-#                 else
-#                     sconflicts = join(map(id, conflicts[rp]), ", ", " and ")
-#                     throw(PkgError("$(id(rp)) requirements can't be satisfied because " *
-#                         "of the following fixed packages: $sconflicts"))
-#                 end
-#             end
-#             Query.check_requirements(sub_reqs, sub_deps, fixed)
-#             sub_deps = Query.prune_dependencies(sub_reqs, sub_deps, bktrc)
-#         catch err
-#             isa(err, PkgError) || rethrow(err)
-#             ## info("ERROR MESSAGE:\n" * err.msg)
-#             for vneq in eq_classes[p][vn]
-#                 push!(problematic, (id(p), vneq, ""))
-#             end
-#             i += 1
-#             continue
-#         end
-#         interface = Interface(sub_reqs, sub_deps)
-#
-#         red_pkgs = interface.pkgs
-#         red_np = interface.np
-#         red_spp = interface.spp
-#         red_pvers = interface.pvers
-#
-#         ok, sol = greedysolver(interface)
-#
-#         if !ok
-#             try
-#                 graph = Graph(interface)
-#                 msgs = Messages(interface, graph)
-#                 sol = maxsum(graph, msgs)
-#                 ok = verify_solution(sol, interface)
-#                 @assert ok
-#             catch err
-#                 isa(err, UnsatError) || rethrow(err)
-#                 pp = red_pkgs[err.info]
-#                 for vneq in eq_classes[p][vn]
-#                     push!(problematic, (id(p), vneq, pp))
-#                 end
-#             end
-#         end
-#         if ok
-#             for p0 = 1:red_np
-#                 s0 = sol[p0]
-#                 if s0 != red_spp[p0]
-#                     j = svdict[(red_pkgs[p0], red_pvers[p0][s0])]
-#                     checked[j] = true
-#                 end
-#             end
-#             checked[i] = true
-#         end
-#         i += 1
-#     end
-#
-#     return sort!(problematic)
-# end
+function sanity_check(graph::NewGraph, sources::Set{UUID} = Set{UUID}())
+    req_inds = graph.req_inds
+    fix_inds = graph.fix_inds
 
+    id(p) = pkgID(p, graph)
 
-# The output format is a Dict which associates a VersionNumber to each installed package name
+    isempty(req_inds) || warn("sanity check called on a graph with non-empty requirements")
+    if !any(is_current_julia(graph, fp0) for fp0 in fix_inds)
+        warn("sanity check called on a graph without current julia requirement, adding it")
+        add_fixed!(graph, Dict(uuid_julia=>Fixed(VERSION)))
+    end
+    if length(fix_inds) ≠ 1
+        warn("sanity check called on a graph with extra fixed requirements (besides julia)")
+    end
+
+    isources = isempty(sources) ?
+        Set{Int}(1:graph.np) :
+        Set{Int}(graph.data.pdict[p] for p in sources)
+
+    simplify_graph!(graph, isources)
+
+    np = graph.np
+    spp = graph.spp
+    gadj = graph.gadj
+    data = graph.data
+    pkgs = data.pkgs
+    pdict = data.pdict
+    pvers = data.pvers
+    eq_classes = data.eq_classes
+
+    problematic = Tuple{String,VersionNumber}[]
+
+    np == 0 && return problematic
+
+    vers = [(pkgs[p0],pvers[p0][v0]) for p0 = 1:np for v0 = 1:(spp[p0]-1)]
+    sort!(vers, by=pv->(-length(gadj[pdict[pv[1]]])))
+
+    nv = length(vers)
+
+    svdict = Dict{Tuple{UUID,VersionNumber},Int}(vers[i] => i for i = 1:nv)
+
+    checked = falses(nv)
+
+    i = 1
+    for (p,vn) in vers
+        length(gadj[pdict[p]]) == 0 && break
+        checked[i] && (i += 1; continue)
+
+        sub_graph = deepcopy(graph)
+        req = Requires(p => vn)
+        add_reqs!(sub_graph, req)
+
+        try
+            simplify_graph!(sub_graph)
+        catch err
+            isa(err, PkgError) || rethrow(err)
+            ## info("ERROR MESSAGE:\n" * err.msg)
+            for vneq in eq_classes[p][vn]
+                push!(problematic, (id(p), vneq))
+            end
+            i += 1
+            continue
+        end
+
+        ok, sol = greedysolver(sub_graph)
+
+        ok && @goto solved
+
+        msgs = Messages(sub_graph)
+
+        try
+            sol = maxsum(graph, msgs)
+            @assert verify_solution(sol)
+        catch err
+            isa(err, UnsatError) || rethrow(err)
+            for vneq in eq_classes[p][vn]
+                push!(problematic, (id(p), vneq))
+            end
+            i += 1
+            continue
+        end
+
+        @label solved
+
+        sol_dict = compute_output_dict(sol, sub_graph)
+        for (sp, svn) in sol_dict
+            j = svdict[sp,svn]
+            checked[j] = true
+        end
+
+        i += 1
+    end
+
+    return sort!(problematic)
+end
+
+# The output format is a Dict which associates a VersionNumber to each installed package UUID
 function compute_output_dict(sol::Vector{Int}, graph::NewGraph)
     np = graph.np
     spp = graph.spp

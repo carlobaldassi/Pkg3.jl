@@ -170,8 +170,8 @@ function sanity_tst(deps_data, expected_result; pkgs=[])
 
     length(result) == length(expected_result) || return false
     expected_result_uuid = [(id(p), vn) for (p,vn) in expected_result]
-    for (p, vn, pp) in result
-        (p, vn) ∈ expected_result_uuid || return  false
+    for r in result
+        r ∈ expected_result_uuid || return  false
     end
     return true
 end
@@ -202,10 +202,10 @@ deps_data = Any[
     ["B", v"2"]
 ]
 
-# @test sanity_tst(deps_data)
-# @test sanity_tst(deps_data, pkgs=["A", "B"])
-# @test sanity_tst(deps_data, pkgs=["B"])
-# @test sanity_tst(deps_data, pkgs=["A"])
+@test sanity_tst(deps_data)
+@test sanity_tst(deps_data, pkgs=["A", "B"])
+@test sanity_tst(deps_data, pkgs=["B"])
+@test sanity_tst(deps_data, pkgs=["A"])
 
 # require just B
 reqs_data = Any[
@@ -233,7 +233,7 @@ deps_data = Any[
     ["B", v"2", "A", "1-*"]
 ]
 
-# @test sanity_tst(deps_data)
+@test sanity_tst(deps_data)
 
 # require just A
 reqs_data = Any[
@@ -268,7 +268,7 @@ deps_data = Any[
     ["C", v"2", "A", "2-*"]
 ]
 
-# @test sanity_tst(deps_data)
+@test sanity_tst(deps_data)
 
 # require just A (must choose solution which has the highest version for A)
 reqs_data = Any[
@@ -306,8 +306,8 @@ deps_data = Any[
     ["B", v"1"]
 ]
 
-# @test sanity_tst(deps_data, [("A", v"1")])
-# @test sanity_tst(deps_data, [("A", v"1")], pkgs=["B"])
+@test sanity_tst(deps_data, [("A", v"1")])
+@test sanity_tst(deps_data, pkgs=["B"])
 
 # require B (must not give errors)
 reqs_data = Any[
@@ -330,9 +330,9 @@ deps_data = Any[
     ["C", v"2"]
 ]
 
-# @test sanity_tst(deps_data, [("A", v"2")])
-# @test sanity_tst(deps_data, [("A", v"2")], pkgs=["B"])
-# @test sanity_tst(deps_data, [("A", v"2")], pkgs=["C"])
+@test sanity_tst(deps_data, [("A", v"2")])
+@test sanity_tst(deps_data, pkgs=["B"])
+@test sanity_tst(deps_data, pkgs=["C"])
 
 # require A, any version (must use the highest non-inconsistent)
 reqs_data = Any[
@@ -357,8 +357,8 @@ deps_data = Any[
     ["B", v"2", "A", "2-*"]
 ]
 
-# @test sanity_tst(deps_data, [("A", v"1"), ("A", v"2"),
-                             # ("B", v"1"), ("B", v"2")])
+@test sanity_tst(deps_data, [("A", v"1"), ("A", v"2"),
+                             ("B", v"1"), ("B", v"2")])
 
 # require A (impossible)
 reqs_data = Any[
@@ -384,8 +384,8 @@ deps_data = Any[
     ["C", v"2", "A", "2-*"],
 ]
 
-# @test sanity_tst(deps_data, [("A", v"1"), ("B", v"1"),
-#                              ("C", v"1")])
+@test sanity_tst(deps_data, [("A", v"1"), ("B", v"1"),
+                             ("C", v"1")])
 
 # require A
 reqs_data = Any[
@@ -419,9 +419,9 @@ deps_data = Any[
     ["C", v"2", "A", "1"],
 ]
 
-# @test sanity_tst(deps_data, [("A", v"1"), ("A", v"2"),
-#                              ("B", v"1"), ("B", v"2"),
-#                              ("C", v"1"), ("C", v"2")])
+@test sanity_tst(deps_data, [("A", v"1"), ("A", v"2"),
+                             ("B", v"1"), ("B", v"2"),
+                             ("C", v"1"), ("C", v"2")])
 
 # require A (impossible)
 reqs_data = Any[
@@ -460,7 +460,7 @@ deps_data = Any[
     ["F", v"2", "E", "*"],
 ]
 
-# @test sanity_tst(deps_data)
+@test sanity_tst(deps_data)
 
 # require just F
 reqs_data = Any[
@@ -522,11 +522,11 @@ deps_data = Any[
     ["E", v"2"]
 ]
 
-# @test sanity_tst(deps_data, [("A", v"2")])
-# @test sanity_tst(deps_data, [("A", v"2")], pkgs=["B"])
-# @test sanity_tst(deps_data, pkgs=["D"])
-# @test sanity_tst(deps_data, pkgs=["E"])
-# @test sanity_tst(deps_data, [("A", v"2")], pkgs=["B", "D"])
+@test sanity_tst(deps_data, [("A", v"2")])
+@test sanity_tst(deps_data, pkgs=["B"])
+@test sanity_tst(deps_data, pkgs=["D"])
+@test sanity_tst(deps_data, pkgs=["E"])
+@test sanity_tst(deps_data, pkgs=["B", "D"])
 
 # require A, any version (must use the highest non-inconsistent)
 reqs_data = Any[
@@ -557,7 +557,7 @@ info("SCHEME 11")
 
 include("resolvedata1.jl")
 
-# @test sanity_tst(deps_data, problematic_data)
+@test sanity_tst(deps_data, problematic_data)
 @test resolve_tst(deps_data, reqs_data, want_data)
 
 end # module

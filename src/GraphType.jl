@@ -130,7 +130,7 @@ mutable struct NewGraph
     #   for each package p0 has a list of bool masks.
     #   Each entry in the list gmsk[p0] is relative to the
     #   package p1 as read from gadj[p0].
-    #   Each mask has dimension spp1 x spp0, where
+    #   Each mask has dimension spp1 × spp0, where
     #   spp0 is the number of states of p0, and
     #   spp1 is the number of states of p1.
     gmsk::Vector{Vector{BitMatrix}}
@@ -373,7 +373,7 @@ function check_consistency(graph::NewGraph)
     for p0 = 1:np
         @assert pdict[pkgs[p0]] == p0
         spp0 = spp[p0]
-        @assert spp0 ≥ 2
+        @assert spp0 ≥ 1
         pvers0 = pvers[p0]
         vdict0 = vdict[p0]
         @assert length(pvers0) == spp0 - 1
@@ -574,8 +574,11 @@ function propagate_constraints!(graph::NewGraph)
     return graph
 end
 
-"Enforce the uninstalled state on all packages that are not reachable from the required ones"
-function disable_unreachable!(graph::NewGraph)
+"""
+Enforce the uninstalled state on all packages that are not reachable from the required ones
+or from the packages in the `sources` argument.
+"""
+function disable_unreachable!(graph::NewGraph, sources::Set{Int} = Set{Int}())
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -585,7 +588,7 @@ function disable_unreachable!(graph::NewGraph)
     pkgs = graph.data.pkgs
 
     # packages which are not allowed to be uninstalled
-    staged = Set{Int}(p0 for p0 = 1:np if !gconstr[p0][end])
+    staged = union(sources, Set{Int}(p0 for p0 = 1:np if !gconstr[p0][end]))
     seen = copy(staged)
 
     while !isempty(staged)
@@ -898,9 +901,9 @@ end
 Simplifies the graph by propagating constraints, disabling unreachable versions and
 then pruning.
 """
-function simplify_graph!(graph::NewGraph)
+function simplify_graph!(graph::NewGraph, sources::Set{Int} = Set{Int}())
     propagate_constraints!(graph)
-    disable_unreachable!(graph)
+    disable_unreachable!(graph, sources)
     prune_graph!(graph)
     build_eq_classes!(graph)
     return graph
