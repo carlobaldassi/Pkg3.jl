@@ -29,6 +29,9 @@ function Base.push!(ritem::NewResolveBacktraceItem, reason, versionmask)
     push!(ritem.why, (reason, versionmask))
 end
 
+# Installation state: either a version, or uninstalled
+const InstState = Union{VersionNumber,Void}
+
 mutable struct GraphData
     # packages list
     pkgs::Vector{UUID}
@@ -65,6 +68,10 @@ mutable struct GraphData
     #                  were explicitly fixed)
     pruned::Dict{UUID,VersionNumber}
 
+    # equivalence classes: for each package and each of its possible
+    #                      states, keep track of other equivalent states
+    eq_classes::Dict{UUID,Dict{InstState,Set{InstState}}}
+
     function GraphData(
             versions::Dict{UUID,Set{VersionNumber}},
             deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
@@ -89,7 +96,11 @@ mutable struct GraphData
 
         pruned = Dict{UUID,VersionNumber}()
 
-        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name, reqs, fixed, pruned)
+        # equivalence classes (at the beginning each state represents just itself)
+        eq_vn(v0, p0) = (v0 == spp[p0] ? nothing : pvers[p0][v0])
+        eq_classes = Dict(pkgs[p0] => Dict(eq_vn(v0,p0) => Set([eq_vn(v0,p0)]) for v0 = 1:spp[p0]) for p0 = 1:np)
+
+        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name, reqs, fixed, pruned, eq_classes)
     end
 end
 
@@ -353,6 +364,7 @@ function check_consistency(graph::NewGraph)
     pvers = data.pvers
     vdict = data.vdict
     pruned = data.pruned
+    eq_classes = data.eq_classes
 
     @assert np ≥ 0
     for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, bktrc, pkgs, pdict, pvers, vdict]
@@ -405,6 +417,11 @@ function check_consistency(graph::NewGraph)
         @assert !gconstr[p0][end]
         @assert count(gconstr[p0]) == 1
     end
+
+    for (p,eq_cl) in eq_classes, (rvn,rvs) in eq_cl
+        @assert rvn ∈ rvs
+    end
+
     return true
 end
 
@@ -597,6 +614,101 @@ function disable_unreachable!(graph::NewGraph)
 end
 
 """
+Reduce the number of versions in the graph by putting all the versions of
+a package that behave identically into equivalence classes, keeping only
+the highest version of the class as representative.
+"""
+function build_eq_classes!(graph::NewGraph)
+    np = graph.np
+    info("Creating equivalence classes")
+    sumspp = sum(graph.spp)
+    for p0 = 1:np
+        build_eq_classes1!(graph, p0)
+    end
+
+    info("""
+         EQ CLASSES STATS:
+           before: $(sumspp)
+           after:  $(sum(graph.spp))
+           """)
+
+    # wipe out backtrace because it doesn't make sense now
+    # TODO: save it somehow?
+    graph.bktrc = [NewResolveBacktraceItem() for p0 = 1:np]
+
+    @assert check_consistency(graph)
+
+    return graph
+end
+
+function build_eq_classes1!(graph::NewGraph, p0::Int)
+    np = graph.np
+    spp = graph.spp
+    gadj = graph.gadj
+    gmsk = graph.gmsk
+    gconstr = graph.gconstr
+    adjdict = graph.adjdict
+    data = graph.data
+    pkgs = data.pkgs
+    pvers = data.pvers
+    vdict = data.vdict
+    eq_classes = data.eq_classes
+
+    # concatenate all the constraints; the columns of the
+    # result encode the behavior of each version
+    cmat = vcat(BitMatrix(gconstr[p0]'), gmsk[p0]...)
+    cvecs = [cmat[:,v0] for v0 = 1:spp[p0]]
+
+    # find unique behaviors
+    repr_vecs = unique(cvecs)
+
+    # number of equivaent classes
+    neq = length(repr_vecs)
+
+    neq == spp[p0] && return # nothing to do here
+
+    # group versions into sets that behave identically
+    eq_sets = [Set{Int}(v0 for v0 in 1:spp[p0] if cvecs[v0] == rvec) for rvec in repr_vecs]
+    sort!(eq_sets, by=maximum)
+
+    # each set is represented by its highest-valued member
+    repr_vers = map(maximum, eq_sets)
+    # the last representative must always be the uninstalled state
+    @assert repr_vers[end] == spp[p0]
+
+    # update equivalence classes
+    eq_vn(v0) = (v0 == spp[p0] ? nothing : pvers[p0][v0])
+    eq_classes0 = eq_classes[pkgs[p0]]
+    for (v0,rvs) in zip(repr_vers, eq_sets)
+        @assert v0 ∈ rvs
+        vn0 = eq_vn(v0)
+        for v1 in rvs
+            v1 == v0 && continue
+            vn1 = eq_vn(v1)
+            @assert vn1 ≢ nothing
+            union!(eq_classes0[vn0], eq_classes0[vn1])
+            delete!(eq_classes0, vn1)
+        end
+    end
+
+    # reduce the constraints and the interaction matrices
+    spp[p0] = neq
+    gconstr[p0] = gconstr[p0][repr_vers]
+    for (j1,p1) in enumerate(gadj[p0])
+        gmsk[p0][j1] = gmsk[p0][j1][:,repr_vers]
+
+        j0 = adjdict[p0][p1]
+        gmsk[p1][j0] = gmsk[p1][j0][repr_vers,:]
+    end
+
+    # reduce/rebuild version dictionaries
+    pvers[p0] = pvers[p0][repr_vers[1:(end-1)]]
+    vdict[p0] = Dict(vn => i for (i,vn) in enumerate(pvers[p0]))
+
+    return
+end
+
+"""
 Prune away fixed and unnecessary packages, and the
 disallowed versions for the remaining packages.
 """
@@ -762,7 +874,7 @@ function prune_graph!(graph::NewGraph)
     data.pvers = new_pvers
     data.vdict = new_vdict
     # Notes:
-    #   * uuid_to_name, reqs and fixed are unchanged
+    #   * uuid_to_name, reqs, fixed, eq_classes are unchanged
     #   * pruned was updated in-place
 
     # Replace old structures with new ones
@@ -790,229 +902,8 @@ function simplify_graph!(graph::NewGraph)
     propagate_constraints!(graph)
     disable_unreachable!(graph)
     prune_graph!(graph)
+    build_eq_classes!(graph)
     return graph
 end
-
-
-# # Reduce the number of versions by creating equivalence classes, and retaining
-# # only the highest version for each equivalence class.
-# # Two versions are equivalent if:
-# #   1) They appear together as dependecies of another package (i.e. for each
-# #      dependency relation, they are both required or both not required)
-# #   2) They have the same dependencies
-# # Preliminarily calls filter_versions.
-# function prune_versions(reqs::Requires, deps::DepsGraph, bktrc::NewResolveBacktrace)
-#     filtered_deps, allowed = filter_versions(reqs, deps, bktrc)
-#     if !isempty(reqs)
-#         filtered_deps = dependencies_subset(filtered_deps, Set{UUID}(keys(reqs)))
-#     end
-#
-#     # To each version in each package, we associate a BitVector.
-#     # It is going to hold a pattern such that all versions with
-#     # the same pattern are equivalent.
-#     vmask = Dict{UUID,Dict{VersionNumber,BitVector}}()
-#
-#     # For each package, we examine the dependencies of its versions
-#     # and put together those which are equal.
-#     # While we're at it, we also collect all dependencies into alldeps
-#     alldeps = Dict{UUID,Set{VersionSpec}}()
-#     for (p,fdepsp) in filtered_deps
-#         # Extract unique dependencies lists (aka classes), thereby
-#         # assigning an index to each class.
-#         uniqdepssets = unique(values(fdepsp))
-#
-#         # Store all dependencies seen so far for later use
-#         for r in uniqdepssets, (rp,rvs) in r
-#             get!(alldeps, rp) do; Set{VersionSpec}() end
-#             push!(alldeps[rp], rvs)
-#         end
-#
-#         # If the package has just one version, it's uninteresting
-#         length(deps[p]) == 1 && continue
-#
-#         # Grow the pattern by the number of classes
-#         luds = length(uniqdepssets)
-#         @assert !haskey(vmask, p)
-#         vmask[p] = Dict{VersionNumber,BitVector}()
-#         vmaskp = vmask[p]
-#         for vn in keys(fdepsp)
-#             vmaskp[vn] = falses(luds)
-#         end
-#         for (vn,vdep) in fdepsp
-#             vmind = findfirst(equalto(vdep), uniqdepssets)
-#             @assert vmind > 0
-#             vm = vmaskp[vn]
-#             vm[vmind] = true
-#         end
-#     end
-#
-#     # Produce dependency patterns.
-#     for (p,vss) in alldeps, vs in vss
-#         # packages with just one version, or dependencies
-#         # which do not distiguish between versions, are not
-#         # interesting
-#         (length(deps[p]) == 1 || vs == VersionSpec()) && continue
-#
-#         # Store the dependency info in the patterns
-#         @assert haskey(vmask, p)
-#         for (vn,vm) in vmask[p]
-#             push!(vm, vn in vs)
-#         end
-#     end
-#
-#     # At this point, the vmask patterns are computed. We divide them into
-#     # classes so that we can keep just one version for each class.
-#     pruned_vers = Dict{UUID,Vector{VersionNumber}}()
-#     eq_classes = Dict{UUID,Dict{VersionNumber,Vector{VersionNumber}}}()
-#     for (p,vmaskp) in vmask
-#         vmask0_uniq = unique(values(vmaskp))
-#         nc = length(vmask0_uniq)
-#         classes = [VersionNumber[] for c0 = 1:nc]
-#         for (vn,vm) in vmaskp
-#             c0 = findfirst(equalto(vm), vmask0_uniq)
-#             push!(classes[c0], vn)
-#         end
-#         map(sort!, classes)
-#
-#         # For each nonempty class, we store only the highest version)
-#         pruned_vers[p] = VersionNumber[]
-#         prunedp = pruned_vers[p]
-#         eq_classes[p] = Dict{VersionNumber,Vector{VersionNumber}}()
-#         eqclassp = eq_classes[p]
-#         for cl in classes
-#             isempty(cl) && continue
-#             vtop = maximum(cl)
-#             push!(prunedp, vtop)
-#             @assert !haskey(eqclassp, vtop)
-#             eqclassp[vtop] = cl
-#         end
-#         sort!(prunedp)
-#     end
-#     # Put non-allowed versions into eq_classes
-#     for (p,allowedp) in allowed
-#         haskey(eq_classes, p) || continue
-#         eqclassp = eq_classes[p]
-#         for (vn,a) in allowedp
-#             a && continue
-#             eqclassp[vn] = [vn]
-#         end
-#     end
-#     # Put all remaining packages into eq_classes
-#     for (p,depsp) in deps
-#         haskey(eq_classes, p) && continue
-#         eq_classes[p] = Dict{VersionNumber,Vector{VersionNumber}}()
-#         eqclassp = eq_classes[p]
-#         for vn in keys(depsp)
-#             eqclassp[vn] = [vn]
-#         end
-#     end
-#
-#
-#     # Recompute deps. We could simplify them, but it's not worth it
-#     new_deps = DepsGraph(deps.uuid_to_name)
-#
-#     for (p,depsp) in filtered_deps
-#         @assert !haskey(new_deps, p)
-#         if !haskey(pruned_vers, p)
-#             new_deps[p] = depsp
-#             continue
-#         end
-#         new_deps[p] = Dict{VersionNumber,Requires}()
-#         pruned_versp = pruned_vers[p]
-#         for (vn,vdep) in depsp
-#             vn ∈ pruned_versp || continue
-#             new_deps[p][vn] = vdep
-#         end
-#     end
-#
-#     #println("pruning stats:")
-#     #numvers = 0
-#     #numdeps = 0
-#     #for (p,d) in deps, (vn,vdep) in d
-#     #    numvers += 1
-#     #    for r in vdep
-#     #        numdeps += 1
-#     #    end
-#     #end
-#     #numnewvers = 0
-#     #numnewdeps = 0
-#     #for (p,d) in new_deps, (vn,vdep) in d
-#     #    numnewvers += 1
-#     #    for r in vdep
-#     #        numnewdeps += 1
-#     #    end
-#     #end
-#     #println("  before: vers=$numvers deps=$numdeps")
-#     #println("  after: vers=$numnewvers deps=$numnewdeps")
-#     #println()
-#
-#     return new_deps, eq_classes
-# end
-# prune_versions(deps::DepsGraph) =
-#     prune_versions(Requires(), deps, NewResolveBacktrace(deps.uuid_to_name))
-#
-# # Build a graph restricted to a subset of the packages
-# function subdeps(deps::DepsGraph, pkgs::Set{UUID})
-#     sub_deps = DepsGraph(deps.uuid_to_name)
-#     for p in pkgs
-#         haskey(sub_deps, p) || (sub_deps[p] = Dict{VersionNumber,Requires}())
-#         sub_depsp = sub_deps[p]
-#         for (vn,vdep) in deps[p]
-#             sub_depsp[vn] = vdep
-#         end
-#     end
-#     return sub_deps
-# end
-#
-# # Build a subgraph incuding only the (direct and indirect) dependencies
-# # of a given package set
-# function dependencies_subset(deps::DepsGraph, pkgs::Set{UUID})
-#     staged::Set{UUID} = filter(p->p ∈ keys(deps), pkgs)
-#     allpkgs = copy(staged)
-#     while !isempty(staged)
-#         staged_next = Set{UUID}()
-#         for p in staged, vdep in values(get(deps, p, Dict{VersionNumber,Requires}())), rp in keys(vdep)
-#             rp ∉ allpkgs && rp ≠ uuid_julia && push!(staged_next, rp)
-#         end
-#         union!(allpkgs, staged_next)
-#         staged = staged_next
-#     end
-#
-#     return subdeps(deps, allpkgs)
-# end
-#
-# # Build a subgraph incuding only the (direct and indirect) dependencies and dependants
-# # of a given package set
-# function undirected_dependencies_subset(deps::DepsGraph, pkgs::Set{UUID})
-#     graph = Dict{UUID,Set{UUID}}()
-#
-#     for (p,d) in deps
-#         haskey(graph, p) || (graph[p] = Set{UUID}())
-#         for vdep in values(d), rp in keys(vdep)
-#             push!(graph[p], rp)
-#             haskey(graph, rp) || (graph[rp] = Set{UUID}())
-#             push!(graph[rp], p)
-#         end
-#     end
-#
-#     staged = pkgs
-#     allpkgs = copy(pkgs)
-#     while !isempty(staged)
-#         staged_next = Set{UUID}()
-#         for p in staged, rp in graph[p]
-#             rp ∉ allpkgs && push!(staged_next, rp)
-#         end
-#         union!(allpkgs, staged_next)
-#         staged = staged_next
-#     end
-#
-#     return subdeps(deps, allpkgs)
-# end
-#
-# function prune_dependencies(reqs::Requires, deps::DepsGraph,
-#                             bktrc::NewResolveBacktrace = init_resolve_backtrace(deps.uuid_to_name, reqs))
-#     deps, _ = prune_versions(reqs, deps, bktrc)
-#     return deps
-# end
 
 end # module
