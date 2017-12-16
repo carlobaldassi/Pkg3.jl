@@ -6,7 +6,7 @@ using ..Types
 import ..Types.uuid_julia
 import Pkg3.equalto
 
-export NewGraph, add_reqs!, add_fixed!, simplify_graph!
+export Graph, add_reqs!, add_fixed!, simplify_graph!
 
 # This is used to keep track of dependency relations when propagating
 # requirements, so as to emit useful information in case of unsatisfiable
@@ -17,15 +17,15 @@ export NewGraph, add_reqs!, add_fixed!, simplify_graph!
 #    fixed packages), :explicit_requirement (for explicitly required packages),
 #    or a Tuple `(:constr_prop, p, backtrace_item)` (for requirements induced
 #    indirectly), where `p` is the package index and `backtrace_item` is
-#    another NewResolveBacktraceItem.
+#    another ResolveBacktraceItem.
 # 2) the second element is a BitVector representing the requirement as a mask
 #    over the possible states of the package
-mutable struct NewResolveBacktraceItem
+mutable struct ResolveBacktraceItem
     why::Vector{Any}
-    NewResolveBacktraceItem() = new(Any[])
+    ResolveBacktraceItem() = new(Any[])
 end
 
-function Base.push!(ritem::NewResolveBacktraceItem, reason, versionmask)
+function Base.push!(ritem::ResolveBacktraceItem, reason, versionmask)
     push!(ritem.why, (reason, versionmask))
 end
 
@@ -113,7 +113,7 @@ function update_depdir(dd0::DepDir, dd1::DepDir)
     return BIDIR
 end
 
-mutable struct NewGraph
+mutable struct Graph
     # data:
     #   stores all the structures required to map between
     #   parsed items (names, UUIDS, version numbers...) and
@@ -162,12 +162,12 @@ mutable struct NewGraph
     spp::Vector{Int}
 
     # backtrace: keep track of the resolution process
-    bktrc::Vector{NewResolveBacktraceItem}
+    bktrc::Vector{ResolveBacktraceItem}
 
     # number of packages (all Vectors above have this length)
     np::Int
 
-    function NewGraph(
+    function Graph(
             versions::Dict{UUID,Set{VersionNumber}},
             deps::Dict{UUID,Dict{VersionRange,Dict{String,UUID}}},
             compat::Dict{UUID,Dict{VersionRange,Dict{String,VersionSpec}}},
@@ -265,7 +265,7 @@ mutable struct NewGraph
         req_inds = Set{Int}()
         fix_inds = Set{Int}()
 
-        bktrc = [NewResolveBacktraceItem() for p0 = 1:np]
+        bktrc = [ResolveBacktraceItem() for p0 = 1:np]
 
         graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, bktrc, np)
 
@@ -282,14 +282,14 @@ end
 """
 Add explicit requirements to the graph.
 """
-function add_reqs!(graph::NewGraph, reqs::Requires)
+function add_reqs!(graph::Graph, reqs::Requires)
     _add_reqs!(graph, reqs, :explicit_requirement)
     check_constraints(graph)
     # TODO: add reqs to graph data?
     return graph
 end
 
-function _add_reqs!(graph::NewGraph, reqs::Requires, reason)
+function _add_reqs!(graph::Graph, reqs::Requires, reason)
     gconstr = graph.gconstr
     spp = graph.spp
     req_inds = graph.req_inds
@@ -315,14 +315,14 @@ function _add_reqs!(graph::NewGraph, reqs::Requires, reason)
 end
 
 "Add fixed packages to the graph, and their requirements."
-function add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
+function add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
     _add_fixed!(graph, fixed)
     check_constraints(graph)
     # TODO: add fixed to graph data?
     return graph
 end
 
-function _add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
+function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
     gconstr = graph.gconstr
     spp = graph.spp
     fix_inds = graph.fix_inds
@@ -344,10 +344,10 @@ function _add_fixed!(graph::NewGraph, fixed::Dict{UUID,Fixed})
     return graph
 end
 
-Types.pkgID(p::UUID, graph::NewGraph) = pkgID(p, graph.data.uuid_to_name)
-Types.pkgID(p0::Int, graph::NewGraph) = pkgID(graph.data.pkgs[p0], graph)
+Types.pkgID(p::UUID, graph::Graph) = pkgID(p, graph.data.uuid_to_name)
+Types.pkgID(p0::Int, graph::Graph) = pkgID(graph.data.pkgs[p0], graph)
 
-function check_consistency(graph::NewGraph)
+function check_consistency(graph::Graph)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -426,12 +426,12 @@ function check_consistency(graph::NewGraph)
 end
 
 "Show the resolution backtrace for some package"
-function showbacktrace(io::IO, graph::NewGraph, p0::Int)
-    _show(io, graph, p0, graph.bktrc[p0], "", Set{NewResolveBacktraceItem}())
+function showbacktrace(io::IO, graph::Graph, p0::Int)
+    _show(io, graph, p0, graph.bktrc[p0], "", Set{ResolveBacktraceItem}())
 end
 
 # Show a recursive tree with requirements applied to a package, either directly or indirectly
-function _show(io::IO, graph::NewGraph, p0::Int, ritem::NewResolveBacktraceItem, indent::String, seen::Set{NewResolveBacktraceItem})
+function _show(io::IO, graph::Graph, p0::Int, ritem::ResolveBacktraceItem, indent::String, seen::Set{ResolveBacktraceItem})
     id0 = pkgID(p0, graph)
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -457,7 +457,7 @@ function _show(io::IO, graph::NewGraph, p0::Int, ritem::NewResolveBacktraceItem,
                 println(io, "an explicit requirement cannot be matched by any of the available versions of $id0")
             end
         else
-            @assert w isa Tuple{Symbol,Int,NewResolveBacktraceItem}
+            @assert w isa Tuple{Symbol,Int,ResolveBacktraceItem}
             @assert w[1] == :constr_prop
             p1 = w[2]
             if !is_current_julia(graph, p1)
@@ -486,7 +486,7 @@ function _show(io::IO, graph::NewGraph, p0::Int, ritem::NewResolveBacktraceItem,
     end
 end
 
-function is_current_julia(graph::NewGraph, p1::Int)
+function is_current_julia(graph::Graph, p1::Int)
     gconstr = graph.gconstr
     fix_inds = graph.fix_inds
     pkgs = graph.data.pkgs
@@ -498,7 +498,7 @@ function is_current_julia(graph::NewGraph, p1::Int)
 end
 
 "Check for contradictions in the constraints."
-function check_constraints(graph::NewGraph)
+function check_constraints(graph::Graph)
     np = graph.np
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -520,7 +520,7 @@ Propagates current constraints, determining new implicit constraints.
 Throws an error in case impossible requirements are detected, printing
 a backtrace.
 """
-function propagate_constraints!(graph::NewGraph)
+function propagate_constraints!(graph::Graph)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -578,7 +578,7 @@ end
 Enforce the uninstalled state on all packages that are not reachable from the required ones
 or from the packages in the `sources` argument.
 """
-function disable_unreachable!(graph::NewGraph, sources::Set{Int} = Set{Int}())
+function disable_unreachable!(graph::Graph, sources::Set{Int} = Set{Int}())
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -621,7 +621,7 @@ Reduce the number of versions in the graph by putting all the versions of
 a package that behave identically into equivalence classes, keeping only
 the highest version of the class as representative.
 """
-function compute_eq_classes!(graph::NewGraph; verbose::Bool = false)
+function compute_eq_classes!(graph::Graph; verbose::Bool = false)
     np = graph.np
     sumspp = sum(graph.spp)
     for p0 = 1:np
@@ -638,14 +638,14 @@ function compute_eq_classes!(graph::NewGraph; verbose::Bool = false)
 
     # wipe out backtrace because it doesn't make sense now
     # TODO: save it somehow?
-    graph.bktrc = [NewResolveBacktraceItem() for p0 = 1:np]
+    graph.bktrc = [ResolveBacktraceItem() for p0 = 1:np]
 
     @assert check_consistency(graph)
 
     return graph
 end
 
-function build_eq_classes1!(graph::NewGraph, p0::Int)
+function build_eq_classes1!(graph::Graph, p0::Int)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -716,7 +716,7 @@ end
 Prune away fixed and unnecessary packages, and the
 disallowed versions for the remaining packages.
 """
-function prune_graph!(graph::NewGraph; verbose::Bool = false)
+function prune_graph!(graph::Graph; verbose::Bool = false)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
@@ -855,7 +855,7 @@ function prune_graph!(graph::NewGraph; verbose::Bool = false)
 
     # Clear out resolution backtrace
     # TODO: save it somehow?
-    new_bktrc = [NewResolveBacktraceItem() for new_p0 = 1:new_np]
+    new_bktrc = [ResolveBacktraceItem() for new_p0 = 1:new_np]
 
     # Done
 
@@ -899,7 +899,7 @@ end
 Simplifies the graph by propagating constraints, disabling unreachable versions, pruning
 and grouping versions into equivalence classes.
 """
-function simplify_graph!(graph::NewGraph, sources::Set{Int} = Set{Int}(); verbose::Bool = false)
+function simplify_graph!(graph::Graph, sources::Set{Int} = Set{Int}(); verbose::Bool = false)
     propagate_constraints!(graph)
     disable_unreachable!(graph, sources)
     prune_graph!(graph, verbose = verbose)

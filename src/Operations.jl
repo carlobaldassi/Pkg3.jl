@@ -2,7 +2,7 @@ module Operations
 
 using Base.Random: UUID
 using Base: LibGit2
-using Pkg3: TerminalMenus, Types, GraphType, Query, Resolve, ResolveNew
+using Pkg3: TerminalMenus, Types, GraphType, Resolve
 import Pkg3: GLOBAL_SETTINGS, depots, BinaryProvider
 import Pkg3.Types: uuid_julia
 
@@ -129,7 +129,7 @@ function load_package_data_raw(T::Type, path::String)
     return data
 end
 
-function deps_graph_new(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Requires, fixed::Dict{UUID,Fixed})
+function deps_graph(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Requires, fixed::Dict{UUID,Fixed})
     uuids = union(keys(reqs), keys(fixed), map(fx->keys(fx.requires), values(fixed))...)
     seen = UUID[]
 
@@ -179,49 +179,7 @@ function deps_graph_new(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Re
         end
         find_registered!(env, uuids)
     end
-    return NewGraph(all_versions, all_deps, all_compat, uuid_to_name, reqs, fixed)
-end
-
-function deps_graph(env::EnvCache, pkgs::Vector{PackageSpec}, uuid_to_name::Dict{UUID,String})
-    deps = DepsGraph(uuid_to_name)
-    uuids = [pkg.uuid for pkg in pkgs]
-    seen = UUID[]
-    while true
-        unseen = setdiff(uuids, seen)
-        isempty(unseen) && break
-        for uuid in unseen
-            push!(seen, uuid)
-            deps[uuid] = valtype(deps)()
-            for path in registered_paths(env, uuid)
-                version_info = load_versions(path)
-                versions = sort!(collect(keys(version_info)))
-                dependencies = load_package_data(UUID, joinpath(path, "dependencies.toml"), versions)
-                compatibility = load_package_data(VersionSpec, joinpath(path, "compatibility.toml"), versions)
-                # if uuid == UUID(0xa8cc5b0e_0ffa_5ad4_8c14_923d3ee1735f)
-                #     @show path
-                #     @show uuid_to_name[uuid]
-                #     @show compatibility
-                # end
-                for v in versions
-                    d = get_or_make(Dict{String,UUID}, dependencies, v)
-                    r = get_or_make(Dict{String,VersionSpec}, compatibility, v)
-                    q = Dict(u => get_or_make(VersionSpec, r, p) for (p, u) in d)
-                    # VERSION in get_or_make(VersionSpec, r, "julia") || continue
-                    deps[uuid][v] = q
-                    for (p, u) in d
-                        u in uuids || push!(uuids, u)
-                    end
-                end
-                # if uuid == UUID(0xa8cc5b0e_0ffa_5ad4_8c14_923d3ee1735f)
-                #     for v in keys(deps[uuid])
-                #         @show v, deps[uuid][v]
-                #     end
-                # end
-            end
-        end
-        find_registered!(env, uuids)
-    end
-    return deps
+    return Graph(all_versions, all_deps, all_compat, uuid_to_name, reqs, fixed)
 end
 
 "Resolve a set of versions given package version specs"
@@ -241,20 +199,16 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     # construct data structures for resolver and call it
     reqs = Requires(pkg.uuid => pkg.version for pkg in pkgs)
     fixed = Dict([uuid_julia => Fixed(VERSION)])
-    deps = deps_graph(env, pkgs, uuid_to_name)
-    deps_new = deps_graph_new(env, uuid_to_name, reqs, fixed)
+    graph = deps_graph(env, uuid_to_name, reqs, fixed)
 
-    for dep_uuid in keys(deps)
+    for dep_uuid in graph.data.pkgs # TODO: check that this is correct
         info = manifest_info(env, dep_uuid)
         if info != nothing
             uuid_to_name[UUID(info["uuid"])] = info["name"]
         end
     end
-    deps = Query.prune_dependencies(reqs, deps)
-    vers = Resolve.resolve(reqs, deps)
-    simplify_graph!(deps_new)
-    vers_new = ResolveNew.resolve(deps_new)
-    @assert vers == vers_new
+    simplify_graph!(graph)
+    vers = resolve(graph)
     find_registered!(env, collect(keys(vers)))
     # update vector of package versions
     for pkg in pkgs
