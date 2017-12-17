@@ -142,8 +142,13 @@ function deps_graph(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Requir
         for uuid in unseen
             push!(seen, uuid)
             all_versions_u = get_or_make!(all_versions, uuid)
-            all_deps_u = get!(all_deps, uuid) do; Dict(VersionRange() => Dict("julia" => uuid_julia)) end
+            all_deps_u = get_or_make!(all_deps, uuid)
             all_compat_u = get_or_make!(all_compat, uuid)
+            # make sure all versions of all packages know about julia uuid
+            if uuid ≠ uuid_julia
+                deps_u_allvers = get_or_make!(all_deps_u, VersionRange())
+                deps_u_allvers["julia"] = uuid_julia
+            end
             for path in registered_paths(env, uuid)
                 version_info = load_versions(path)
                 versions = sort!(collect(keys(version_info)))
@@ -212,7 +217,8 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     find_registered!(env, collect(keys(vers)))
     # update vector of package versions
     for pkg in pkgs
-        pkg.version = vers[pkg.uuid]
+        # Fixed packages are not returned by resolve (they already have their version set)
+        haskey(vers, pkg.uuid) && (pkg.version = vers[pkg.uuid])
     end
     uuids = UUID[pkg.uuid for pkg in pkgs]
     for (uuid, ver) in vers
