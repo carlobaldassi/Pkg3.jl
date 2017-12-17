@@ -184,6 +184,13 @@ function deps_graph(env::EnvCache, uuid_to_name::Dict{UUID,String}, reqs::Requir
         end
         find_registered!(env, uuids)
     end
+
+    for uuid in uuids
+        info = manifest_info(env, uuid)
+        info ≡ nothing && continue
+        uuid_to_name[UUID(info["uuid"])] = info["name"]
+    end
+
     return Graph(all_versions, all_deps, all_compat, uuid_to_name, reqs, fixed)
 end
 
@@ -192,7 +199,7 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     info("Resolving package versions")
     # anything not mentioned is fixed
     uuids = UUID[pkg.uuid for pkg in pkgs]
-    uuid_to_name = Dict{UUID,String}()
+    uuid_to_name = Dict{UUID,String}(uuid_julia => "julia")
     for (name::String, uuid::UUID) in env.project["deps"]
         uuid_to_name[uuid] = name
         uuid in uuids && continue
@@ -206,12 +213,6 @@ function resolve_versions!(env::EnvCache, pkgs::Vector{PackageSpec})::Dict{UUID,
     fixed = Dict([uuid_julia => Fixed(VERSION)])
     graph = deps_graph(env, uuid_to_name, reqs, fixed)
 
-    for dep_uuid in graph.data.pkgs # TODO: check that this is correct
-        info = manifest_info(env, dep_uuid)
-        if info != nothing
-            uuid_to_name[UUID(info["uuid"])] = info["name"]
-        end
-    end
     simplify_graph!(graph)
     vers = resolve(graph)
     find_registered!(env, collect(keys(vers)))

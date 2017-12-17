@@ -269,8 +269,8 @@ mutable struct Graph
 
         graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, bktrc, np)
 
-        _add_reqs!(graph, reqs, :explicit_requirement)
         _add_fixed!(graph, fixed)
+        _add_reqs!(graph, reqs, :explicit_requirement)
 
         @assert check_consistency(graph)
         check_constraints(graph)
