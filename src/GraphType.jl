@@ -223,6 +223,7 @@ mutable struct Graph
         adjdict = [Dict{Int,Int}() for p0 = 1:np]
 
         for p0 = 1:np, v0 = 1:(spp[p0]-1), (p1,rmsk1) in extended_deps[p0][v0]
+            @assert p0 ≠ p1
             j0 = get(adjdict[p1], p0, length(gadj[p0]) + 1)
             j1 = get(adjdict[p0], p1, length(gadj[p1]) + 1)
 
@@ -395,6 +396,7 @@ function check_consistency(graph::Graph)
         @assert length(adjdict0) == length(gadj0)
         @assert length(gdir0) == length(gadj0)
         for (j0,p1) in enumerate(gadj0)
+            @assert p1 ≠ p0
             @assert adjdict[p1][p0] == j0
             spp1 = spp[p1]
             @assert size(gmsk0[j0]) == (spp1,spp0)
