@@ -317,7 +317,7 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason)
         old_constr = copy(gconstr[rp0])
         gconstr[rp0] .&= new_constr
         reason ≡ :explicit_requirement && push!(req_inds, rp0)
-        old_constr ≠ gconstr[rp0] && add_bktrcitem_req!(graph, rp, rvs, reason)
+        old_constr ≠ gconstr[rp0] && add_bktrcentry_req!(graph, rp, rvs, reason)
     end
     return graph
 end
@@ -345,7 +345,7 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
         new_constr[fv0] = true
         gconstr[fp0] .&= new_constr
         push!(fix_inds, fp0)
-        bkitem = add_bktrcitem_fixed!(graph, fp, fx)
+        bkitem = add_bktrcentry_fixed!(graph, fp, fx)
         _add_reqs!(graph, fx.requires, (fp, bkitem))
     end
     return graph
@@ -445,18 +445,22 @@ function init_backtrace!(graph::Graph)
         if isempty(versions)
             msg = "$id has no known versions!" # This shouldn't happen?
         else
-            msg = "$id possible versions are: $(VersionSpec(VersionRange.(versions))) or uninstalled"
+            msg = "possible versions are: $(VersionSpec(VersionRange.(versions))) or uninstalled"
         end
-        entry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(p) end
+        ventry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(p) end
+        entry = ResolveBacktraceEntry(p)
+
         if p ≠ uuid_julia
             push!(entry, (nothing, msg))
-            push!(bktrc.init, (entry, "$id backtrace"))
+            init_entry = (entry, "$id backtrace:")
+            push!(ventry, init_entry)
+            push!(bktrc.init, init_entry)
         end
     end
     return graph
 end
 
-function add_bktrcitem_fixed!(graph::Graph, fp::UUID, fx::Fixed)
+function add_bktrcentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
     bktrc = graph.bktrc
     id = pkgID(fp, graph)
     msg = "$id is fixed to version $(fx.version)"
@@ -465,13 +469,13 @@ function add_bktrcitem_fixed!(graph::Graph, fp::UUID, fx::Fixed)
     return entry
 end
 
-function add_bktrcitem_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
+function add_bktrcentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     bktrc = graph.bktrc
     gconstr = graph.gconstr
     pdict = graph.data.pdict
     pvers = graph.data.pvers
     id = pkgID(rp, graph)
-    msg = "$id was restricted to versions $rvs by "
+    msg = "restricted to versions $rvs by "
     if reason isa Symbol
         @assert reason == :explicit_requirement
         other_entry = nothing
@@ -494,12 +498,12 @@ function add_bktrcitem_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     else
         msg *= "leaving no versions left"
     end
-    entry = bktrc.pool[rp]
+    entry = bktrc.pool[rp].reasons[1][1]
     push!(entry, (other_entry, msg))
     return entry
 end
 
-function add_bktrcitem_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
+function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
     bktrc = graph.bktrc
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -522,7 +526,7 @@ function add_bktrcitem_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0
     other_p, other_entry = pkgs[p0], bktrc.pool[pkgs[p0]]
     other_id = pkgID(other_p, graph)
     if any(vmask)
-        msg = "$id was implicitly restricted by "
+        msg = "implicitly restricted by "
         if other_p == uuid_julia
             msg *= "julia compatibility requirements "
             other_entry = nothing # don't propagate the backtrace
@@ -540,7 +544,7 @@ function add_bktrcitem_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0
             end
         end
     else
-        msg = "$id was found to have no compatible versions left with "
+        msg = "found to have no compatible versions left with "
         if other_p == uuid_julia
             msg *= "julia"
             other_entry = nothing # don't propagate the backtrace
@@ -549,12 +553,12 @@ function add_bktrcitem_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0
             msg *= "requirements implicity induced by $other_id "
         end
     end
-    entry = bktrc.pool[p]
+    entry = bktrc.pool[p].reasons[1][1]
     push!(entry, (other_entry, msg))
     return entry
 end
 
-function add_bktrcitem_pruned!(graph::Graph, p0::Int, s0::Int)
+function add_bktrcentry_pruned!(graph::Graph, p0::Int, s0::Int)
     bktrc = graph.bktrc
     spp = graph.spp
     pkgs = graph.data.pkgs
@@ -563,11 +567,53 @@ function add_bktrcitem_pruned!(graph::Graph, p0::Int, s0::Int)
     p = pkgs[p0]
     id = pkgID(p, graph)
     if s0 == spp[p0]
-        msg = "$id was determined to be unneeded"
+        msg = "determined to be unneeded during graph pruning"
     else
-        msg = "$id was automatically fixed to its only remaining available version, $(pvers[p0][s0])"
+        msg = "fixed during graph pruning to its only remaining available version, $(pvers[p0][s0])"
     end
-    entry = bktrc.pool[p]
+    entry = bktrc.pool[p].reasons[1][1]
+    push!(entry, (nothing, msg))
+    return entry
+end
+
+function add_bktrcentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
+    bktrc = graph.bktrc
+    spp = graph.spp
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    p = pkgs[p0]
+    id = pkgID(p, graph)
+    if s0 == spp[p0]
+        msg = "determined to be unneeded by the solver"
+    else
+        msg = "set by the solver to the maximum version compatible with the constraints: $(pvers[p0][s0])"
+    end
+    entry = bktrc.pool[p].reasons[1][1]
+    push!(entry, (nothing, msg))
+    return entry
+end
+
+function add_bktrcentry_eq_classes!(graph::Graph, p0::Int)
+    bktrc = graph.bktrc
+    spp = graph.spp
+    gconstr = graph.gconstr
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    if any(gconstr[p0][1:(end-1)])
+        vns = string(VersionSpec(VersionRange.(pvers[p0][gconstr[p0][1:(end-1)]])))
+        gconstr[p0][end] && (vns *= " or uninstalled")
+    elseif gconstr[p0][end]
+        vns = "uninstalled"
+    else
+        vns = "no version"
+    end
+
+    p = pkgs[p0]
+    id = pkgID(p, graph)
+    msg = "versions reduced by equivalence to: $vns"
+    entry = bktrc.pool[p].reasons[1][1]
     push!(entry, (nothing, msg))
     return entry
 end
@@ -663,7 +709,7 @@ function propagate_constraints!(graph::Graph)
                 # previous ones, record it and propagate them next
                 if gconstr1 ≠ old_gconstr1
                     push!(staged_next, p1)
-                    add_bktrcitem_implicit_req!(graph, p1, added_constr1, p0)
+                    add_bktrcentry_implicit_req!(graph, p1, added_constr1, p0)
                 end
                 if !any(gconstr1)
                     err_msg = "Unsatisfiable requirements detected for package $(id(p1)):\n"
@@ -751,6 +797,7 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     gmsk = graph.gmsk
     gconstr = graph.gconstr
     adjdict = graph.adjdict
+    bktrc = graph.bktrc
     data = graph.data
     pkgs = data.pkgs
     pvers = data.pvers
@@ -808,7 +855,8 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     pvers[p0] = pvers[p0][repr_vers[1:(end-1)]]
     vdict[p0] = Dict(vn => i for (i,vn) in enumerate(pvers[p0]))
 
-    # TODO: record this in the backtrace?
+    # put a record in the backtrace
+    add_bktrcentry_eq_classes!(graph, p0)
 
     return
 end
@@ -869,7 +917,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
         # We don't record fixed packages
         p0 ∈ fix_inds && (@assert s0 ≠ spp[p0]; continue)
         p0 ∈ req_inds && @assert s0 ≠ spp[p0]
-        add_bktrcitem_pruned!(graph, p0, s0)
+        add_bktrcentry_pruned!(graph, p0, s0)
         # We don't record as pruned packages that are not going to be installed
         s0 == spp[p0] && continue
         @assert !haskey(pruned, pkgs[p0])

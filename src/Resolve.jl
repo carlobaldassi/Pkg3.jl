@@ -257,6 +257,10 @@ function greedysolver(graph::Graph)
 
     @assert verify_solution(sol, graph)
 
+    for p0 = 1:np
+        GraphType.add_bktrcentry_greedysolved!(graph, p0, sol[p0])
+    end
+
     return true, sol
 end
 
