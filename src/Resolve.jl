@@ -9,7 +9,7 @@ using ..Types
 using ..GraphType
 using .MaxSum
 import ..Types: uuid_julia
-import ..GraphType: is_current_julia
+import ..GraphType: is_julia
 
 export resolve, sanity_check
 
@@ -76,8 +76,8 @@ function sanity_check(graph::Graph, sources::Set{UUID} = Set{UUID}(); verbose::B
     id(p) = pkgID(p, graph)
 
     isempty(req_inds) || warn("sanity check called on a graph with non-empty requirements")
-    if !any(is_current_julia(graph, fp0) for fp0 in fix_inds)
-        warn("sanity check called on a graph without current julia requirement, adding it")
+    if !any(is_julia(graph, fp0) for fp0 in fix_inds)
+        warn("sanity check called on a graph without julia requirement, adding it")
         add_fixed!(graph, Dict(uuid_julia=>Fixed(VERSION)))
     end
     if length(fix_inds) ≠ 1

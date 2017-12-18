@@ -6,7 +6,7 @@ using ..Types
 import ..Types.uuid_julia
 import Pkg3.equalto
 
-export Graph, add_reqs!, add_fixed!, simplify_graph!
+export Graph, add_reqs!, add_fixed!, simplify_graph!, showbacktrace
 
 # This is used to keep track of dependency relations when propagating
 # requirements, so as to emit useful information in case of unsatisfiable
@@ -15,18 +15,25 @@ export Graph, add_reqs!, add_fixed!, simplify_graph!
 # entry is a Tuple of two elements:
 # 1) the first element is the reason, and it can be either :fixed (for
 #    fixed packages), :explicit_requirement (for explicitly required packages),
-#    or a Tuple `(:constr_prop, p, backtrace_item)` (for requirements induced
-#    indirectly), where `p` is the package index and `backtrace_item` is
-#    another ResolveBacktraceItem.
+#    or a Tuple `(:constr_prop, p, backtrace_entry)` (for requirements induced
+#    indirectly), where `p` is the package index and `backtrace_entry` is
+#    another ResolveBacktraceEntry.
 # 2) the second element is a BitVector representing the requirement as a mask
 #    over the possible states of the package
-mutable struct ResolveBacktraceItem
-    why::Vector{Any}
-    ResolveBacktraceItem() = new(Any[])
+
+# const ResolveBacktraceEntry = Vector{Tuple{Union{ResolveBacktraceEntry,Void},String}}
+mutable struct ResolveBacktraceEntry
+    pkg::UUID
+    reasons::Vector{Tuple{Any,String}}
+    ResolveBacktraceEntry(pkg::UUID) = new(pkg, [])
 end
 
-function Base.push!(ritem::ResolveBacktraceItem, reason, versionmask)
-    push!(ritem.why, (reason, versionmask))
+Base.push!(entry::ResolveBacktraceEntry, reason) = push!(entry.reasons, reason)
+
+mutable struct ResolveBacktrace
+    init::ResolveBacktraceEntry
+    pool::Dict{UUID,ResolveBacktraceEntry}
+    ResolveBacktrace() = new(ResolveBacktraceEntry(uuid_julia), Dict())
 end
 
 # Installation state: either a version, or uninstalled
@@ -162,7 +169,7 @@ mutable struct Graph
     spp::Vector{Int}
 
     # backtrace: keep track of the resolution process
-    bktrc::Vector{ResolveBacktraceItem}
+    bktrc::ResolveBacktrace
 
     # number of packages (all Vectors above have this length)
     np::Int
@@ -266,10 +273,11 @@ mutable struct Graph
         req_inds = Set{Int}()
         fix_inds = Set{Int}()
 
-        bktrc = [ResolveBacktraceItem() for p0 = 1:np]
+        bktrc = ResolveBacktrace()
 
         graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, bktrc, np)
 
+        init_backtrace!(graph)
         _add_fixed!(graph, fixed)
         _add_reqs!(graph, reqs, :explicit_requirement)
 
@@ -294,7 +302,6 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason)
     gconstr = graph.gconstr
     spp = graph.spp
     req_inds = graph.req_inds
-    bktrc = graph.bktrc
     pdict = graph.data.pdict
     pvers = graph.data.pvers
 
@@ -310,7 +317,7 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason)
         old_constr = copy(gconstr[rp0])
         gconstr[rp0] .&= new_constr
         reason ≡ :explicit_requirement && push!(req_inds, rp0)
-        old_constr ≠ gconstr[rp0] && push!(bktrc[rp0], reason, new_constr)
+        old_constr ≠ gconstr[rp0] && add_bktrcitem_req!(graph, rp, rvs, reason)
     end
     return graph
 end
@@ -327,7 +334,6 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
     gconstr = graph.gconstr
     spp = graph.spp
     fix_inds = graph.fix_inds
-    bktrc = graph.bktrc
     pdict = graph.data.pdict
     vdict = graph.data.vdict
 
@@ -339,8 +345,8 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
         new_constr[fv0] = true
         gconstr[fp0] .&= new_constr
         push!(fix_inds, fp0)
-        push!(bktrc[fp0], :fixed, new_constr)
-        _add_reqs!(graph, fx.requires, (:constr_prop, fp0, bktrc[fp0]))
+        bkitem = add_bktrcitem_fixed!(graph, fp, fx)
+        _add_reqs!(graph, fx.requires, (fp, bkitem))
     end
     return graph
 end
@@ -368,7 +374,7 @@ function check_consistency(graph::Graph)
     eq_classes = data.eq_classes
 
     @assert np ≥ 0
-    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, bktrc, pkgs, pdict, pvers, vdict]
+    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, bktrc.pool, pkgs, pdict, pvers, vdict]
         @assert length(x) == np
     end
     for p0 = 1:np
@@ -427,77 +433,172 @@ function check_consistency(graph::Graph)
     return true
 end
 
-"Show the resolution backtrace for some package"
-function showbacktrace(io::IO, graph::Graph, p0::Int)
-    _show(io, graph, p0, graph.bktrc[p0], "", Set{ResolveBacktraceItem}())
+function init_backtrace!(graph::Graph)
+    np = graph.np
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+    bktrc = graph.bktrc
+    for p0 = 1:np
+        p = pkgs[p0]
+        id = pkgID(p0, graph)
+        versions = pvers[p0]
+        if isempty(versions)
+            msg = "$id has no known versions!" # This shouldn't happen?
+        else
+            msg = "$id possible versions are: $(VersionSpec(VersionRange.(versions))) or uninstalled"
+        end
+        entry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(p) end
+        if p ≠ uuid_julia
+            push!(entry, (nothing, msg))
+            push!(bktrc.init, (entry, "$id backtrace"))
+        end
+    end
+    return graph
 end
 
-# Show a recursive tree with requirements applied to a package, either directly or indirectly
-function _show(io::IO, graph::Graph, p0::Int, ritem::ResolveBacktraceItem, indent::String, seen::Set{ResolveBacktraceItem})
-    id0 = pkgID(p0, graph)
+function add_bktrcitem_fixed!(graph::Graph, fp::UUID, fx::Fixed)
+    bktrc = graph.bktrc
+    id = pkgID(fp, graph)
+    msg = "$id is fixed to version $(fx.version)"
+    entry = bktrc.pool[fp]
+    push!(entry, (nothing, msg))
+    return entry
+end
+
+function add_bktrcitem_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
+    bktrc = graph.bktrc
+    gconstr = graph.gconstr
+    pdict = graph.data.pdict
+    pvers = graph.data.pvers
+    id = pkgID(rp, graph)
+    msg = "$id was restricted to versions $rvs by "
+    if reason isa Symbol
+        @assert reason == :explicit_requirement
+        other_entry = nothing
+        msg *= "an explicit requirement, "
+    else
+        @assert reason isa Tuple{UUID,ResolveBacktraceEntry}
+        other_p, other_entry = reason
+        if other_p == uuid_julia
+            msg *= "julia compatibility requirements, "
+            other_entry = nothing
+        else
+            other_id = pkgID(other_p, graph)
+            msg *= "$other_id, "
+        end
+    end
+    rp0 = pdict[rp]
+    @assert !gconstr[rp0][end]
+    if any(gconstr[rp0])
+        msg *= "leaving only versions $(VersionSpec(VersionRange.(pvers[rp0][gconstr[rp0][1:(end-1)]])))"
+    else
+        msg *= "leaving no versions left"
+    end
+    entry = bktrc.pool[rp]
+    push!(entry, (other_entry, msg))
+    return entry
+end
+
+function add_bktrcitem_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
+    bktrc = graph.bktrc
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
 
     function vs_string(p0::Int, vmask::BitVector)
-        vns = Vector{Any}(pvers[p0][vmask[1:(end-1)]])
-        vmask[end] && push!(vns, "uninstalled")
-        return join(string.(vns), ", ", " or ")
+        if any(vmask[1:(end-1)])
+            vns = string(VersionSpec(VersionRange.(pvers[p0][vmask[1:(end-1)]])))
+            vmask[end] && (vns *= " or uninstalled")
+        elseif vmask[end]
+            vns = "uninstalled"
+        else
+            vns = "no version"
+        end
+        return vns
     end
 
-    l = length(ritem.why)
-    for (i,(w,vmask)) in enumerate(ritem.why)
-        print(io, indent, (i==l ? '└' : '├'), '─')
-        if w ≡ :fixed
-            @assert count(vmask) == 1
-            println(io, "$id0 is fixed to version ", vs_string(p0, vmask))
-        elseif w ≡ :explicit_requirement
-            @assert !vmask[end]
-            if any(vmask)
-                println(io, "an explicit requirement sets $id0 to versions: ", vs_string(p0, vmask))
-            else
-                println(io, "an explicit requirement cannot be matched by any of the available versions of $id0")
-            end
+    p = pkgs[p1]
+    id = pkgID(p, graph)
+    other_p, other_entry = pkgs[p0], bktrc.pool[pkgs[p0]]
+    other_id = pkgID(other_p, graph)
+    if any(vmask)
+        msg = "$id was implicitly restricted by "
+        if other_p == uuid_julia
+            msg *= "julia compatibility requirements "
+            other_entry = nothing # don't propagate the backtrace
         else
-            @assert w isa Tuple{Symbol,Int,ResolveBacktraceItem}
-            @assert w[1] == :constr_prop
-            p1 = w[2]
-            if !is_current_julia(graph, p1)
-                id1 = pkgID(p1, graph)
-                otheritem = w[3]
-                if any(vmask)
-                    println(io, "the only versions of $id0 compatible with $id1 (whose allowed versions are $(vs_string(p1, gconstr[p1])))\n",
-                                indent, (i==l ? "  " : "│ "),"are these: ", vs_string(p0, vmask))
-                else
-                    println(io, "no versions of $id0 are compatible with $id1 (whose allowed versions are $(vs_string(p1, gconstr[p1])))")
-                end
-                if otheritem ∈ seen
-                    println(io, indent, (i==l ? "  " : "│ "), "└─see above for $id1 backtrace")
-                    continue
-                end
-                push!(seen, otheritem)
-                _show(io, graph, p1, otheritem, indent * (i==l ? "  " : "│ "), seen)
+            other_id = pkgID(other_p, graph)
+            msg *= "$other_id "
+        end
+        msg *= "to versions: $(vs_string(p1, vmask))"
+        if vmask ≠ gconstr[p1]
+            msg *= ", leaving "
+            if any(gconstr[p1])
+                msg *= "only versions: $(vs_string(p1, gconstr[p1]))"
             else
-                if any(vmask)
-                    println(io, "the only versions of $id0 compatible with julia v$VERSION are these: ", vs_string(p0, vmask))
-                else
-                    println(io, "no versions of $id0 are compatible with julia v$VERSION")
-                end
+                msg *= "no versions left"
             end
         end
+    else
+        msg = "$id was found to have no compatible versions left with "
+        if other_p == uuid_julia
+            msg *= "julia"
+            other_entry = nothing # don't propagate the backtrace
+        else
+            other_id = pkgID(other_p, graph)
+            msg *= "requirements implicity induced by $other_id "
+        end
     end
+    entry = bktrc.pool[p]
+    push!(entry, (other_entry, msg))
+    return entry
 end
 
-function is_current_julia(graph::Graph, p1::Int)
-    gconstr = graph.gconstr
-    fix_inds = graph.fix_inds
+function add_bktrcitem_pruned!(graph::Graph, p0::Int, s0::Int)
+    bktrc = graph.bktrc
+    spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
 
-    (pkgs[p1] == uuid_julia && p1 ∈ fix_inds) || return false
-    jconstr = gconstr[p1]
-    return length(jconstr) == 2 && !jconstr[2] && pvers[p1][1] == VERSION
+    p = pkgs[p0]
+    id = pkgID(p, graph)
+    if s0 == spp[p0]
+        msg = "$id was determined to be unneeded"
+    else
+        msg = "$id was automatically fixed to its only remaining available version, $(pvers[p0][s0])"
+    end
+    entry = bktrc.pool[p]
+    push!(entry, (nothing, msg))
+    return entry
 end
+
+"Show the full resolution backtrace"
+function showbacktrace(io::IO, graph::Graph)
+    _show(io, graph, graph.bktrc.init, "", ObjectIdDict())
+end
+
+"Show the resolution backtrace for some package"
+function showbacktrace(io::IO, graph::Graph, p::UUID)
+    _show(io, graph, graph.bktrc.pool[p], "", ObjectIdDict())
+end
+
+# Show a recursive tree with requirements applied to a package, either directly or indirectly
+function _show(io::IO, graph::Graph, entry::ResolveBacktraceEntry, indent::String, seen::ObjectIdDict)
+    l = length(entry.reasons)
+    for (i,(otheritem,msg)) in enumerate(entry.reasons)
+        print(io, indent, (i==l ? '└' : '├'), '─')
+        println(io, msg)
+        otheritem ≡ nothing && continue
+        if otheritem ∈ keys(seen)
+            println(io, indent, (i==l ? "  " : "│ "), "└─see above for the backtrace of $(pkgID(otheritem.pkg, graph))")
+            continue
+        end
+        seen[otheritem] = true
+        _show(io, graph, otheritem, indent * (i==l ? "  " : "│ "), seen)
+    end
+end
+
+is_julia(graph::Graph, p0::Int) = graph.data.pkgs[p0] == uuid_julia
 
 "Check for contradictions in the constraints."
 function check_constraints(graph::Graph)
@@ -506,12 +607,12 @@ function check_constraints(graph::Graph)
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
 
-    id(p0::Int) = pkgID(pkgs[p0], graph)
+    id(p0::Int) = pkgID(p0, graph)
 
     for p0 = 1:np
         any(gconstr[p0]) && continue
         err_msg = "Unsatisfiable requirements detected for package $(id(p0)):\n"
-        err_msg *= sprint(showbacktrace, graph, p0)
+        err_msg *= sprint(showbacktrace, graph, pkgs[p0])
         throw(PkgError(err_msg))
     end
     return true
@@ -544,7 +645,7 @@ function propagate_constraints!(graph::Graph)
             gconstr0 = gconstr[p0]
             for (j1,p1) in enumerate(gadj[p0])
                 # we don't propagate to julia (purely to have better error messages)
-                is_current_julia(graph, p1) && continue
+                pkgs[p1] == uuid_julia && continue
 
                 msk = gmsk[p0][j1]
                 # consider the sub-mask with only allowed versions of p0
@@ -562,11 +663,11 @@ function propagate_constraints!(graph::Graph)
                 # previous ones, record it and propagate them next
                 if gconstr1 ≠ old_gconstr1
                     push!(staged_next, p1)
-                    push!(bktrc[p1], (:constr_prop, p0, bktrc[p0]), added_constr1)
+                    add_bktrcitem_implicit_req!(graph, p1, added_constr1, p0)
                 end
                 if !any(gconstr1)
                     err_msg = "Unsatisfiable requirements detected for package $(id(p1)):\n"
-                    err_msg *= sprint(showbacktrace, graph, p1)
+                    err_msg *= sprint(showbacktrace, graph, pkgs[p1])
                     throw(PkgError(err_msg))
                 end
             end
@@ -638,10 +739,6 @@ function compute_eq_classes!(graph::Graph; verbose::Bool = false)
              """)
     end
 
-    # wipe out backtrace because it doesn't make sense now
-    # TODO: save it somehow?
-    graph.bktrc = [ResolveBacktraceItem() for p0 = 1:np]
-
     @assert check_consistency(graph)
 
     return graph
@@ -711,6 +808,8 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     pvers[p0] = pvers[p0][repr_vers[1:(end-1)]]
     vdict[p0] = Dict(vn => i for (i,vn) in enumerate(pvers[p0]))
 
+    # TODO: record this in the backtrace?
+
     return
 end
 
@@ -770,7 +869,8 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
         # We don't record fixed packages
         p0 ∈ fix_inds && (@assert s0 ≠ spp[p0]; continue)
         p0 ∈ req_inds && @assert s0 ≠ spp[p0]
-        # We don't record packages that are not going to be installed
+        add_bktrcitem_pruned!(graph, p0, s0)
+        # We don't record as pruned packages that are not going to be installed
         s0 == spp[p0] && continue
         @assert !haskey(pruned, pkgs[p0])
         pruned[pkgs[p0]] = pvers[p0][s0]
@@ -855,9 +955,8 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     end
     new_gmsk = [[compute_gmsk(new_p0, new_j0) for new_j0 = 1:length(new_gadj[new_p0])] for new_p0 = 1:new_np]
 
-    # Clear out resolution backtrace
-    # TODO: save it somehow?
-    new_bktrc = [ResolveBacktraceItem() for new_p0 = 1:new_np]
+    # Reduce backtrace pool (the other items are still reachable through bktrc.init)
+    bktrc.pool = Dict(p=>bktrc.pool[p] for p in new_pkgs)
 
     # Done
 
@@ -878,7 +977,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     data.vdict = new_vdict
     # Notes:
     #   * uuid_to_name, reqs, fixed, eq_classes are unchanged
-    #   * pruned was updated in-place
+    #   * pruned and bktrc were updated in-place
 
     # Replace old structures with new ones
     graph.gadj = new_gadj
@@ -889,7 +988,6 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     graph.req_inds = new_req_inds
     graph.fix_inds = new_fix_inds
     graph.spp = new_spp
-    graph.bktrc = new_bktrc
     graph.np = new_np
 
     @assert check_consistency(graph)
