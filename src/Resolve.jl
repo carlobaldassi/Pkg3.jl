@@ -9,7 +9,7 @@ using ..Types
 using ..GraphType
 using .MaxSum
 import ..Types: uuid_julia
-import ..GraphType: is_julia, add_rlogentry_greedysolved!, add_rlogentry_maxsumsolved!
+import ..GraphType: is_julia, log_event_greedysolved!, log_event_maxsumsolved!
 
 export resolve, sanity_check
 
@@ -258,7 +258,7 @@ function greedysolver(graph::Graph)
     @assert verify_solution(sol, graph)
 
     for p0 = 1:np
-        add_rlogentry_greedysolved!(graph, p0, sol[p0])
+        log_event_greedysolved!(graph, p0, sol[p0])
     end
 
     return true, sol
@@ -367,7 +367,7 @@ function enforce_optimality!(sol::Vector{Int}, graph::Graph)
     @assert verify_solution(sol, graph)
 
     for p0 = 1:np
-        add_rlogentry_maxsumsolved!(graph, p0, sol[p0], why[p0])
+        log_event_maxsumsolved!(graph, p0, sol[p0], why[p0])
     end
 end
 

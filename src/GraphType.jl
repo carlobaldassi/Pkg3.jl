@@ -14,7 +14,7 @@ export Graph, add_reqs!, add_fixed!, simplify_graph!, showlog
 # entry representing another package's influence (or `nothing`) and
 # a message for the log.
 #
-# Specialized functions called `add_rlogentry_[...]!` are used to store the
+# Specialized functions called `log_event_[...]!` are used to store the
 # various events. The events are also recorded in orded in a shared
 # ResolveJournal, which is used to provide a plain chronological view.
 #
@@ -342,7 +342,7 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason)
         old_constr = copy(gconstr[rp0])
         gconstr[rp0] .&= new_constr
         reason ≡ :explicit_requirement && push!(req_inds, rp0)
-        old_constr ≠ gconstr[rp0] && add_rlogentry_req!(graph, rp, rvs, reason)
+        old_constr ≠ gconstr[rp0] && log_event_req!(graph, rp, rvs, reason)
     end
     return graph
 end
@@ -370,7 +370,7 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
         new_constr[fv0] = true
         gconstr[fp0] .&= new_constr
         push!(fix_inds, fp0)
-        bkitem = add_rlogentry_fixed!(graph, fp, fx)
+        bkitem = log_event_fixed!(graph, fp, fx)
         _add_reqs!(graph, fx.requires, (fp, bkitem))
     end
     return graph
@@ -483,7 +483,7 @@ function init_log!(data::GraphData)
     return data
 end
 
-function add_rlogentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
+function log_event_fixed!(graph::Graph, fp::UUID, fx::Fixed)
     rlog = graph.data.rlog
     id = pkgID(fp, graph)
     msg = "$id is fixed to version $(fx.version)"
@@ -492,7 +492,7 @@ function add_rlogentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
     return entry
 end
 
-function add_rlogentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
+function log_event_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     rlog = graph.data.rlog
     gconstr = graph.gconstr
     pdict = graph.data.pdict
@@ -526,7 +526,7 @@ function add_rlogentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     return entry
 end
 
-function add_rlogentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
+function log_event_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
     rlog = graph.data.rlog
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -581,7 +581,7 @@ function add_rlogentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0
     return entry
 end
 
-function add_rlogentry_pruned!(graph::Graph, p0::Int, s0::Int)
+function log_event_pruned!(graph::Graph, p0::Int, s0::Int)
     rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
@@ -599,7 +599,7 @@ function add_rlogentry_pruned!(graph::Graph, p0::Int, s0::Int)
     return entry
 end
 
-function add_rlogentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
+function log_event_greedysolved!(graph::Graph, p0::Int, s0::Int)
     rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
@@ -621,7 +621,7 @@ function add_rlogentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
     return entry
 end
 
-function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
+function log_event_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
     rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
@@ -645,7 +645,7 @@ function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol
     return entry
 end
 
-function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
+function log_event_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
     rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
@@ -666,7 +666,7 @@ function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
     return entry
 end
 
-function add_rlogentry_eq_classes!(graph::Graph, p0::Int)
+function log_event_eq_classes!(graph::Graph, p0::Int)
     rlog = graph.data.rlog
     spp = graph.spp
     gconstr = graph.gconstr
@@ -836,7 +836,7 @@ function propagate_constraints!(graph::Graph)
                 # previous ones, record it and propagate them next
                 if gconstr1 ≠ old_gconstr1
                     push!(staged_next, p1)
-                    add_rlogentry_implicit_req!(graph, p1, added_constr1, p0)
+                    log_event_implicit_req!(graph, p1, added_constr1, p0)
                 end
                 if !any(gconstr1)
                     err_msg = "Unsatisfiable requirements detected for package $(id(p1)):\n"
@@ -983,7 +983,7 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     vdict[p0] = Dict(vn => i for (i,vn) in enumerate(pvers[p0]))
 
     # put a record in the log
-    add_rlogentry_eq_classes!(graph, p0)
+    log_event_eq_classes!(graph, p0)
 
     return
 end
@@ -1044,7 +1044,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
         # We don't record fixed packages
         p0 ∈ fix_inds && (@assert s0 ≠ spp[p0]; continue)
         p0 ∈ req_inds && @assert s0 ≠ spp[p0]
-        add_rlogentry_pruned!(graph, p0, s0)
+        log_event_pruned!(graph, p0, s0)
         # We don't record as pruned packages that are not going to be installed
         s0 == spp[p0] && continue
         @assert !haskey(pruned, pkgs[p0])
