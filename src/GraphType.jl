@@ -6,7 +6,7 @@ using ..Types
 import ..Types.uuid_julia
 import Pkg3.equalto
 
-export Graph, add_reqs!, add_fixed!, simplify_graph!, showbacktrace
+export Graph, add_reqs!, add_fixed!, simplify_graph!, showlog
 
 # This is used to keep track of dependency relations when propagating
 # requirements, so as to emit useful information in case of unsatisfiable
@@ -17,35 +17,34 @@ export Graph, add_reqs!, add_fixed!, simplify_graph!, showbacktrace
 #    fixed packages), :explicit_requirement (for explicitly required packages),
 #    or a Tuple `(:constr_prop, p, backtrace_entry)` (for requirements induced
 #    indirectly), where `p` is the package index and `backtrace_entry` is
-#    another ResolveBacktraceEntry.
+#    another ResolveLogEntry.
 # 2) the second element is a BitVector representing the requirement as a mask
 #    over the possible states of the package
 
 const ResolveJournal = Vector{Tuple{UUID,String}}
 
-# const ResolveBacktraceEntry = Vector{Tuple{Union{ResolveBacktraceEntry,Void},String}}
-mutable struct ResolveBacktraceEntry
+# const ResolveLogEntry = Vector{Tuple{Union{ResolveLogEntry,Void},String}}
+mutable struct ResolveLogEntry
     journal::ResolveJournal # shared with all other entries
     pkg::UUID
     header::String
     events::Vector{Tuple{Any,String}}
-    ResolveBacktraceEntry(journal::ResolveJournal, pkg::UUID, msg::String = "") = new(journal, pkg, msg, [])
+    ResolveLogEntry(journal::ResolveJournal, pkg::UUID, msg::String = "") = new(journal, pkg, msg, [])
 end
 
-function Base.push!(entry::ResolveBacktraceEntry, reason::Tuple{Union{ResolveBacktraceEntry,Void},String})
+function Base.push!(entry::ResolveLogEntry, reason::Tuple{Union{ResolveLogEntry,Void},String})
     push!(entry.events, reason)
     entry.pkg ≠ uuid_julia && push!(entry.journal, (entry.pkg, reason[2]))
     return entry
 end
 
-mutable struct ResolveBacktrace
-    init::ResolveBacktraceEntry
-    pool::Dict{UUID,ResolveBacktraceEntry}
+mutable struct ResolveLog
+    init::ResolveLogEntry
+    pool::Dict{UUID,ResolveLogEntry}
     journal::Vector{Tuple{UUID,String}}
-    function ResolveBacktrace()
+    function ResolveLog()
         journal = ResolveJournal()
-        bktrc = new(ResolveBacktraceEntry(journal, uuid_julia), Dict(), journal)
-        return bktrc
+        return new(ResolveLogEntry(journal, uuid_julia), Dict(), journal)
     end
 end
 
@@ -181,8 +180,8 @@ mutable struct Graph
     # states per package: same as in GraphData
     spp::Vector{Int}
 
-    # backtrace: keep track of the resolution process
-    bktrc::ResolveBacktrace
+    # resolve log: keep track of the resolution process
+    rlog::ResolveLog
 
     # number of packages (all Vectors above have this length)
     np::Int
@@ -286,11 +285,11 @@ mutable struct Graph
         req_inds = Set{Int}()
         fix_inds = Set{Int}()
 
-        bktrc = ResolveBacktrace()
+        rlog = ResolveLog()
 
-        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, bktrc, np)
+        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, rlog, np)
 
-        init_backtrace!(graph)
+        init_log!(graph)
         _add_fixed!(graph, fixed)
         _add_reqs!(graph, reqs, :explicit_requirement)
 
@@ -330,7 +329,7 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason)
         old_constr = copy(gconstr[rp0])
         gconstr[rp0] .&= new_constr
         reason ≡ :explicit_requirement && push!(req_inds, rp0)
-        old_constr ≠ gconstr[rp0] && add_bktrcentry_req!(graph, rp, rvs, reason)
+        old_constr ≠ gconstr[rp0] && add_rlogentry_req!(graph, rp, rvs, reason)
     end
     return graph
 end
@@ -358,7 +357,7 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
         new_constr[fv0] = true
         gconstr[fp0] .&= new_constr
         push!(fix_inds, fp0)
-        bkitem = add_bktrcentry_fixed!(graph, fp, fx)
+        bkitem = add_rlogentry_fixed!(graph, fp, fx)
         _add_reqs!(graph, fx.requires, (fp, bkitem))
     end
     return graph
@@ -377,7 +376,7 @@ function check_consistency(graph::Graph)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
-    bktrc = graph.bktrc
+    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
@@ -387,7 +386,7 @@ function check_consistency(graph::Graph)
     eq_classes = data.eq_classes
 
     @assert np ≥ 0
-    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, bktrc.pool, pkgs, pdict, pvers, vdict]
+    for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, rlog.pool, pkgs, pdict, pvers, vdict]
         @assert length(x) == np
     end
     for p0 = 1:np
@@ -446,11 +445,11 @@ function check_consistency(graph::Graph)
     return true
 end
 
-function init_backtrace!(graph::Graph)
+function init_log!(graph::Graph)
     np = graph.np
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
-    bktrc = graph.bktrc
+    rlog = graph.rlog
     for p0 = 1:np
         p = pkgs[p0]
         id = pkgID(p0, graph)
@@ -460,27 +459,27 @@ function init_backtrace!(graph::Graph)
         else
             msg = "possible versions are: $(VersionSpec(VersionRange.(versions))) or uninstalled"
         end
-        first_entry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(bktrc.journal, p, "$id log:") end
+        first_entry = get!(rlog.pool, p) do; ResolveLogEntry(rlog.journal, p, "$id log:") end
 
         if p ≠ uuid_julia
             push!(first_entry, (nothing, msg))
-            push!(bktrc.init, (first_entry, ""))
+            push!(rlog.init, (first_entry, ""))
         end
     end
     return graph
 end
 
-function add_bktrcentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
-    bktrc = graph.bktrc
+function add_rlogentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
+    rlog = graph.rlog
     id = pkgID(fp, graph)
     msg = "$id is fixed to version $(fx.version)"
-    entry = bktrc.pool[fp]
+    entry = rlog.pool[fp]
     push!(entry, (nothing, msg))
     return entry
 end
 
-function add_bktrcentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
-    bktrc = graph.bktrc
+function add_rlogentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
+    rlog = graph.rlog
     gconstr = graph.gconstr
     pdict = graph.data.pdict
     pvers = graph.data.pvers
@@ -491,7 +490,7 @@ function add_bktrcentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
         other_entry = nothing
         msg *= "an explicit requirement, "
     else
-        @assert reason isa Tuple{UUID,ResolveBacktraceEntry}
+        @assert reason isa Tuple{UUID,ResolveLogEntry}
         other_p, other_entry = reason
         if other_p == uuid_julia
             msg *= "julia compatibility requirements, "
@@ -508,13 +507,13 @@ function add_bktrcentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     else
         msg *= "leaving no versions left"
     end
-    entry = bktrc.pool[rp]
+    entry = rlog.pool[rp]
     push!(entry, (other_entry, msg))
     return entry
 end
 
-function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
-    bktrc = graph.bktrc
+function add_rlogentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
+    rlog = graph.rlog
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -533,13 +532,13 @@ function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p
 
     p = pkgs[p1]
     id = pkgID(p, graph)
-    other_p, other_entry = pkgs[p0], bktrc.pool[pkgs[p0]]
+    other_p, other_entry = pkgs[p0], rlog.pool[pkgs[p0]]
     other_id = pkgID(other_p, graph)
     if any(vmask)
         msg = "restricted by "
         if other_p == uuid_julia
             msg *= "julia compatibility requirements "
-            other_entry = nothing # don't propagate the backtrace
+            other_entry = nothing # don't propagate the log
         else
             other_id = pkgID(other_p, graph)
             msg *= "compatibility requirements with $other_id "
@@ -557,19 +556,19 @@ function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p
         msg = "found to have no compatible versions left with "
         if other_p == uuid_julia
             msg *= "julia"
-            other_entry = nothing # don't propagate the backtrace
+            other_entry = nothing # don't propagate the log
         else
             other_id = pkgID(other_p, graph)
             msg *= "$other_id "
         end
     end
-    entry = bktrc.pool[p]
+    entry = rlog.pool[p]
     push!(entry, (other_entry, msg))
     return entry
 end
 
-function add_bktrcentry_pruned!(graph::Graph, p0::Int, s0::Int)
-    bktrc = graph.bktrc
+function add_rlogentry_pruned!(graph::Graph, p0::Int, s0::Int)
+    rlog = graph.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -581,13 +580,13 @@ function add_bktrcentry_pruned!(graph::Graph, p0::Int, s0::Int)
     else
         msg = "fixed during graph pruning to its only remaining available version, $(pvers[p0][s0])"
     end
-    entry = bktrc.pool[p]
+    entry = rlog.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
 
-function add_bktrcentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
-    bktrc = graph.bktrc
+function add_rlogentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
+    rlog = graph.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -603,13 +602,13 @@ function add_bktrcentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
             msg = "set by the solver to the maximum version compatible with the constraints: $(pvers[p0][s0])"
         end
     end
-    entry = bktrc.pool[p]
+    entry = rlog.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
 
-function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
-    bktrc = graph.bktrc
+function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
+    rlog = graph.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -627,13 +626,13 @@ function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbo
             msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate its constraints)"
         end
     end
-    entry = bktrc.pool[p]
+    entry = rlog.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
 
-function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
-    bktrc = graph.bktrc
+function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
+    rlog = graph.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -647,14 +646,14 @@ function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
     else
         msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate a dependecy relation with $other_id)"
     end
-    other_entry = bktrc.pool[pkgs[p1]]
-    entry = bktrc.pool[p]
+    other_entry = rlog.pool[pkgs[p1]]
+    entry = rlog.pool[p]
     push!(entry, (other_entry, msg))
     return entry
 end
 
-function add_bktrcentry_eq_classes!(graph::Graph, p0::Int)
-    bktrc = graph.bktrc
+function add_rlogentry_eq_classes!(graph::Graph, p0::Int)
+    rlog = graph.rlog
     spp = graph.spp
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -672,42 +671,42 @@ function add_bktrcentry_eq_classes!(graph::Graph, p0::Int)
     p = pkgs[p0]
     id = pkgID(p, graph)
     msg = "versions reduced by equivalence to: $vns"
-    entry = bktrc.pool[p]
+    entry = rlog.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
 
-"Show the full resolution backtrace"
-function showbacktrace(io::IO, graph::Graph; view::Symbol = :plain)
+"Show the full resolution log"
+function showlog(io::IO, graph::Graph; view::Symbol = :plain)
     view ∈ [:plain, :tree, :chronological] || throw(ArgumentError("the view argument should be `:plain`, `:tree` or `:chronological`"))
     println(io, "Resolve log:")
-    view == :chronological && return showbacktracejournal(io, graph)
+    view == :chronological && return showlogjournal(io, graph)
     seen = ObjectIdDict()
     recursive = (view == :tree)
-    initentries = [event[1] for event in graph.bktrc.init.events]
+    initentries = [event[1] for event in graph.rlog.init.events]
     for entry in sort!(initentries, by=(entry->pkgID(entry.pkg, graph)))
         _show(io, graph, entry, "", seen, recursive)
         recursive && (seen[entry] = true)
     end
 end
 
-function showbacktracejournal(io::IO, graph::Graph)
-    journal = graph.bktrc.journal
+function showlogjournal(io::IO, graph::Graph)
+    journal = graph.rlog.journal
     padding = maximum(length(pkgID(p, graph)) for (p,_) in journal)
     for (p, msg) in journal
         println(io, ' ', rpad(pkgID(p, graph), padding), ": ", msg)
     end
 end
 
-"Show the resolution backtrace for some package"
-function showbacktrace(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
+"Show the resolution log for some package"
+function showlog(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
     view ∈ [:plain, :tree] || throw(ArgumentError("the view argument should be `:plain` or `:tree`"))
     recursive = (view == :tree)
-    _show(io, graph, graph.bktrc.pool[p], "", ObjectIdDict(), recursive)
+    _show(io, graph, graph.rlog.pool[p], "", ObjectIdDict(), recursive)
 end
 
 # Show a recursive tree with requirements applied to a package, either directly or indirectly
-function _show(io::IO, graph::Graph, entry::ResolveBacktraceEntry, indent::String, seen::ObjectIdDict, recursive::Bool)
+function _show(io::IO, graph::Graph, entry::ResolveLogEntry, indent::String, seen::ObjectIdDict, recursive::Bool)
     toplevel = isempty(indent)
     firstglyph = toplevel ? "" : "└─"
     pre = toplevel ? "" : "  "
@@ -746,7 +745,7 @@ function check_constraints(graph::Graph)
     for p0 = 1:np
         any(gconstr[p0]) && continue
         err_msg = "Unsatisfiable requirements detected for package $(id(p0)):\n"
-        err_msg *= sprint(showbacktrace, graph, pkgs[p0])
+        err_msg *= sprint(showlog, graph, pkgs[p0])
         throw(PkgError(err_msg))
     end
     return true
@@ -755,14 +754,14 @@ end
 """
 Propagates current constraints, determining new implicit constraints.
 Throws an error in case impossible requirements are detected, printing
-a backtrace.
+a log trace.
 """
 function propagate_constraints!(graph::Graph)
     np = graph.np
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
-    bktrc = graph.bktrc
+    rlog = graph.rlog
     gconstr = graph.gconstr
     adjdict = graph.adjdict
     pkgs = graph.data.pkgs
@@ -797,11 +796,11 @@ function propagate_constraints!(graph::Graph)
                 # previous ones, record it and propagate them next
                 if gconstr1 ≠ old_gconstr1
                     push!(staged_next, p1)
-                    add_bktrcentry_implicit_req!(graph, p1, added_constr1, p0)
+                    add_rlogentry_implicit_req!(graph, p1, added_constr1, p0)
                 end
                 if !any(gconstr1)
                     err_msg = "Unsatisfiable requirements detected for package $(id(p1)):\n"
-                    err_msg *= sprint(showbacktrace, graph, pkgs[p1])
+                    err_msg *= sprint(showlog, graph, pkgs[p1])
                     throw(PkgError(err_msg))
                 end
             end
@@ -885,7 +884,7 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     gmsk = graph.gmsk
     gconstr = graph.gconstr
     adjdict = graph.adjdict
-    bktrc = graph.bktrc
+    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pvers = data.pvers
@@ -943,8 +942,8 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     pvers[p0] = pvers[p0][repr_vers[1:(end-1)]]
     vdict[p0] = Dict(vn => i for (i,vn) in enumerate(pvers[p0]))
 
-    # put a record in the backtrace
-    add_bktrcentry_eq_classes!(graph, p0)
+    # put a record in the log
+    add_rlogentry_eq_classes!(graph, p0)
 
     return
 end
@@ -963,7 +962,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
-    bktrc = graph.bktrc
+    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
@@ -1005,7 +1004,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
         # We don't record fixed packages
         p0 ∈ fix_inds && (@assert s0 ≠ spp[p0]; continue)
         p0 ∈ req_inds && @assert s0 ≠ spp[p0]
-        add_bktrcentry_pruned!(graph, p0, s0)
+        add_rlogentry_pruned!(graph, p0, s0)
         # We don't record as pruned packages that are not going to be installed
         s0 == spp[p0] && continue
         @assert !haskey(pruned, pkgs[p0])
@@ -1091,8 +1090,8 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     end
     new_gmsk = [[compute_gmsk(new_p0, new_j0) for new_j0 = 1:length(new_gadj[new_p0])] for new_p0 = 1:new_np]
 
-    # Reduce backtrace pool (the other items are still reachable through bktrc.init)
-    bktrc.pool = Dict(p=>bktrc.pool[p] for p in new_pkgs)
+    # Reduce log pool (the other items are still reachable through rlog.init)
+    rlog.pool = Dict(p=>rlog.pool[p] for p in new_pkgs)
 
     # Done
 
@@ -1113,7 +1112,7 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     data.vdict = new_vdict
     # Notes:
     #   * uuid_to_name, reqs, fixed, eq_classes are unchanged
-    #   * pruned and bktrc were updated in-place
+    #   * pruned and rlog were updated in-place
 
     # Replace old structures with new ones
     graph.gadj = new_gadj
