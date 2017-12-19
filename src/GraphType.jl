@@ -52,6 +52,10 @@ end
 # Installation state: either a version, or uninstalled
 const InstState = Union{VersionNumber,Void}
 
+
+# GraphData is basically a part of Graph that collects data structures useful
+# for interfacing the internal abstract representation of Graph with the
+# input/output (e.g. converts between package UUIDs and node numbers, etc.)
 mutable struct GraphData
     # packages list
     pkgs::Vector{UUID}
@@ -76,8 +80,11 @@ mutable struct GraphData
     #                  pvers[p0][vdict[p0][vn]] = vn
     vdict::Vector{Dict{VersionNumber,Int}}
 
+    # UUID to names
     uuid_to_name::Dict{UUID,String}
 
+    # requirements and fixed packages, passed at initialization
+    # (TODO: these are probably useless?)
     reqs::Requires
     fixed::Dict{UUID,Fixed}
 
@@ -91,6 +98,9 @@ mutable struct GraphData
     # equivalence classes: for each package and each of its possible
     #                      states, keep track of other equivalent states
     eq_classes::Dict{UUID,Dict{InstState,Set{InstState}}}
+
+    # resolve log: keep track of the resolution process
+    rlog::ResolveLog
 
     function GraphData(
             versions::Dict{UUID,Set{VersionNumber}},
@@ -114,13 +124,21 @@ mutable struct GraphData
         # generate vdict
         vdict = [Dict{VersionNumber,Int}(vn => i for (i,vn) in enumerate(pvers[p0])) for p0 = 1:np]
 
+        # nothing is pruned yet, of course
         pruned = Dict{UUID,VersionNumber}()
 
         # equivalence classes (at the beginning each state represents just itself)
         eq_vn(v0, p0) = (v0 == spp[p0] ? nothing : pvers[p0][v0])
         eq_classes = Dict(pkgs[p0] => Dict(eq_vn(v0,p0) => Set([eq_vn(v0,p0)]) for v0 = 1:spp[p0]) for p0 = 1:np)
 
-        return new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name, reqs, fixed, pruned, eq_classes)
+        # the resolution log is actually initialized below
+        rlog = ResolveLog()
+
+        data = new(pkgs, np, spp, pdict, pvers, vdict, uuid_to_name, reqs, fixed, pruned, eq_classes, rlog)
+
+        init_log!(data)
+
+        return data
     end
 end
 
@@ -181,9 +199,6 @@ mutable struct Graph
     # states per package: same as in GraphData
     spp::Vector{Int}
 
-    # resolve log: keep track of the resolution process
-    rlog::ResolveLog
-
     # number of packages (all Vectors above have this length)
     np::Int
 
@@ -200,7 +215,7 @@ mutable struct Graph
         extra_uuids ⊆ keys(versions) || error("unknown UUID found in reqs/fixed") # TODO?
 
         data = GraphData(versions, deps, compat, uuid_to_name, reqs, fixed)
-        pkgs, np, spp, pdict, pvers, vdict = data.pkgs, data.np, data.spp, data.pdict, data.pvers, data.vdict
+        pkgs, np, spp, pdict, pvers, vdict, rlog = data.pkgs, data.np, data.spp, data.pdict, data.pvers, data.vdict, data.rlog
 
         extended_deps = [[Dict{Int,BitVector}() for v0 = 1:(spp[p0]-1)] for p0 = 1:np]
         for p0 = 1:np, v0 = 1:(spp[p0]-1)
@@ -286,11 +301,8 @@ mutable struct Graph
         req_inds = Set{Int}()
         fix_inds = Set{Int}()
 
-        rlog = ResolveLog()
+        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, np)
 
-        graph = new(data, gadj, gmsk, gdir, gconstr, adjdict, req_inds, fix_inds, spp, rlog, np)
-
-        init_log!(graph)
         _add_fixed!(graph, fixed)
         _add_reqs!(graph, reqs, :explicit_requirement)
 
@@ -364,8 +376,9 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID,Fixed})
     return graph
 end
 
-Types.pkgID(p::UUID, graph::Graph) = pkgID(p, graph.data.uuid_to_name)
-Types.pkgID(p0::Int, graph::Graph) = pkgID(graph.data.pkgs[p0], graph)
+Types.pkgID(p::UUID, data::GraphData) = pkgID(p, data.uuid_to_name)
+Types.pkgID(p0::Int, data::GraphData) = pkgID(data.pkgs[p0], data)
+Types.pkgID(p, graph::Graph) = pkgID(p, graph.data)
 
 function check_consistency(graph::Graph)
     np = graph.np
@@ -377,7 +390,6 @@ function check_consistency(graph::Graph)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
-    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
@@ -385,6 +397,7 @@ function check_consistency(graph::Graph)
     vdict = data.vdict
     pruned = data.pruned
     eq_classes = data.eq_classes
+    rlog = data.rlog
 
     @assert np ≥ 0
     for x in [spp, gadj, gmsk, gdir, gconstr, adjdict, rlog.pool, pkgs, pdict, pvers, vdict]
@@ -446,14 +459,14 @@ function check_consistency(graph::Graph)
     return true
 end
 
-function init_log!(graph::Graph)
-    np = graph.np
-    pkgs = graph.data.pkgs
-    pvers = graph.data.pvers
-    rlog = graph.rlog
+function init_log!(data::GraphData)
+    np = data.np
+    pkgs = data.pkgs
+    pvers = data.pvers
+    rlog = data.rlog
     for p0 = 1:np
         p = pkgs[p0]
-        id = pkgID(p0, graph)
+        id = pkgID(p0, data)
         versions = pvers[p0]
         if isempty(versions)
             msg = "$id has no known versions!" # This shouldn't happen?
@@ -467,11 +480,11 @@ function init_log!(graph::Graph)
             push!(rlog.init, (first_entry, ""))
         end
     end
-    return graph
+    return data
 end
 
 function add_rlogentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     id = pkgID(fp, graph)
     msg = "$id is fixed to version $(fx.version)"
     entry = rlog.pool[fp]
@@ -480,7 +493,7 @@ function add_rlogentry_fixed!(graph::Graph, fp::UUID, fx::Fixed)
 end
 
 function add_rlogentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     gconstr = graph.gconstr
     pdict = graph.data.pdict
     pvers = graph.data.pvers
@@ -514,7 +527,7 @@ function add_rlogentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
 end
 
 function add_rlogentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0::Int)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -569,7 +582,7 @@ function add_rlogentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p0
 end
 
 function add_rlogentry_pruned!(graph::Graph, p0::Int, s0::Int)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -587,7 +600,7 @@ function add_rlogentry_pruned!(graph::Graph, p0::Int, s0::Int)
 end
 
 function add_rlogentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -609,7 +622,7 @@ function add_rlogentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
 end
 
 function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -633,7 +646,7 @@ function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol
 end
 
 function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     spp = graph.spp
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
@@ -654,7 +667,7 @@ function add_rlogentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
 end
 
 function add_rlogentry_eq_classes!(graph::Graph, p0::Int)
-    rlog = graph.rlog
+    rlog = graph.data.rlog
     spp = graph.spp
     gconstr = graph.gconstr
     pkgs = graph.data.pkgs
@@ -691,7 +704,7 @@ function showlog(io::IO, graph::Graph; view::Symbol = :plain)
     view == :chronological && return showlogjournal(io, graph)
     seen = ObjectIdDict()
     recursive = (view == :tree)
-    initentries = [event[1] for event in graph.rlog.init.events]
+    initentries = [event[1] for event in graph.data.rlog.init.events]
     for entry in sort!(initentries, by=(entry->pkgID(entry.pkg, graph)))
         _show(io, graph, entry, "", seen, recursive)
         recursive && (seen[entry] = true)
@@ -699,7 +712,7 @@ function showlog(io::IO, graph::Graph; view::Symbol = :plain)
 end
 
 function showlogjournal(io::IO, graph::Graph)
-    journal = graph.rlog.journal
+    journal = graph.data.rlog.journal
     padding = maximum(length(pkgID(p, graph)) for (p,_) in journal)
     for (p, msg) in journal
         println(io, ' ', rpad(pkgID(p, graph), padding), ": ", msg)
@@ -713,10 +726,11 @@ the same as for `showlog(io, graph)`); the default is `:tree`.
 """
 function showlog(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
     view ∈ [:plain, :tree] || throw(ArgumentError("the view argument should be `:plain` or `:tree`"))
+    rlog = graph.data.rlog
     if view == :tree
-        _show(io, graph, graph.rlog.pool[p], "", ObjectIdDict(), true)
+        _show(io, graph, rlog.pool[p], "", ObjectIdDict(), true)
     else
-        entries = ResolveLogEntry[graph.rlog.pool[p]]
+        entries = ResolveLogEntry[rlog.pool[p]]
         function getentries(entry)
             for (other_entry,_) in entry.events
                 (other_entry ≡ nothing || other_entry ∈ entries) && continue
@@ -724,7 +738,7 @@ function showlog(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
                 getentries(other_entry)
             end
         end
-        getentries(graph.rlog.pool[p])
+        getentries(rlog.pool[p])
         for entry in entries
             _show(io, graph, entry, "", ObjectIdDict(), false)
         end
@@ -787,11 +801,11 @@ function propagate_constraints!(graph::Graph)
     spp = graph.spp
     gadj = graph.gadj
     gmsk = graph.gmsk
-    rlog = graph.rlog
     gconstr = graph.gconstr
     adjdict = graph.adjdict
     pkgs = graph.data.pkgs
     pvers = graph.data.pvers
+    rlog = graph.data.rlog
 
     id(p0::Int) = pkgID(pkgs[p0], graph)
 
@@ -910,12 +924,12 @@ function build_eq_classes1!(graph::Graph, p0::Int)
     gmsk = graph.gmsk
     gconstr = graph.gconstr
     adjdict = graph.adjdict
-    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pvers = data.pvers
     vdict = data.vdict
     eq_classes = data.eq_classes
+    rlog = data.rlog
 
     # concatenate all the constraints; the columns of the
     # result encode the behavior of each version
@@ -988,13 +1002,13 @@ function prune_graph!(graph::Graph; verbose::Bool = false)
     adjdict = graph.adjdict
     req_inds = graph.req_inds
     fix_inds = graph.fix_inds
-    rlog = graph.rlog
     data = graph.data
     pkgs = data.pkgs
     pdict = data.pdict
     pvers = data.pvers
     vdict = data.vdict
     pruned = data.pruned
+    rlog = data.rlog
 
     # We will remove all packages that only have one allowed state
     # (includes fixed packages and forbidden packages)
