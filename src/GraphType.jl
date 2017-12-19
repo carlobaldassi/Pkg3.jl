@@ -21,19 +21,32 @@ export Graph, add_reqs!, add_fixed!, simplify_graph!, showbacktrace
 # 2) the second element is a BitVector representing the requirement as a mask
 #    over the possible states of the package
 
+const ResolveJournal = Vector{Tuple{UUID,String}}
+
 # const ResolveBacktraceEntry = Vector{Tuple{Union{ResolveBacktraceEntry,Void},String}}
 mutable struct ResolveBacktraceEntry
+    journal::ResolveJournal # shared with all other entries
     pkg::UUID
-    reasons::Vector{Tuple{Any,String}}
-    ResolveBacktraceEntry(pkg::UUID) = new(pkg, [])
+    header::String
+    events::Vector{Tuple{Any,String}}
+    ResolveBacktraceEntry(journal::ResolveJournal, pkg::UUID, msg::String = "") = new(journal, pkg, msg, [])
 end
 
-Base.push!(entry::ResolveBacktraceEntry, reason) = push!(entry.reasons, reason)
+function Base.push!(entry::ResolveBacktraceEntry, reason::Tuple{Union{ResolveBacktraceEntry,Void},String})
+    push!(entry.events, reason)
+    entry.pkg ≠ uuid_julia && push!(entry.journal, (entry.pkg, reason[2]))
+    return entry
+end
 
 mutable struct ResolveBacktrace
     init::ResolveBacktraceEntry
     pool::Dict{UUID,ResolveBacktraceEntry}
-    ResolveBacktrace() = new(ResolveBacktraceEntry(uuid_julia), Dict())
+    journal::Vector{Tuple{UUID,String}}
+    function ResolveBacktrace()
+        journal = ResolveJournal()
+        bktrc = new(ResolveBacktraceEntry(journal, uuid_julia), Dict(), journal)
+        return bktrc
+    end
 end
 
 # Installation state: either a version, or uninstalled
@@ -447,14 +460,11 @@ function init_backtrace!(graph::Graph)
         else
             msg = "possible versions are: $(VersionSpec(VersionRange.(versions))) or uninstalled"
         end
-        ventry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(p) end
-        entry = ResolveBacktraceEntry(p)
+        first_entry = get!(bktrc.pool, p) do; ResolveBacktraceEntry(bktrc.journal, p, "$id log:") end
 
         if p ≠ uuid_julia
-            push!(entry, (nothing, msg))
-            init_entry = (entry, "$id backtrace:")
-            push!(ventry, init_entry)
-            push!(bktrc.init, init_entry)
+            push!(first_entry, (nothing, msg))
+            push!(bktrc.init, (first_entry, ""))
         end
     end
     return graph
@@ -498,7 +508,7 @@ function add_bktrcentry_req!(graph::Graph, rp::UUID, rvs::VersionSpec, reason)
     else
         msg *= "leaving no versions left"
     end
-    entry = bktrc.pool[rp].reasons[1][1]
+    entry = bktrc.pool[rp]
     push!(entry, (other_entry, msg))
     return entry
 end
@@ -526,13 +536,13 @@ function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p
     other_p, other_entry = pkgs[p0], bktrc.pool[pkgs[p0]]
     other_id = pkgID(other_p, graph)
     if any(vmask)
-        msg = "implicitly restricted by "
+        msg = "restricted by "
         if other_p == uuid_julia
             msg *= "julia compatibility requirements "
             other_entry = nothing # don't propagate the backtrace
         else
             other_id = pkgID(other_p, graph)
-            msg *= "$other_id "
+            msg *= "compatibility requirements with $other_id "
         end
         msg *= "to versions: $(vs_string(p1, vmask))"
         if vmask ≠ gconstr[p1]
@@ -550,10 +560,10 @@ function add_bktrcentry_implicit_req!(graph::Graph, p1::Int, vmask::BitVector, p
             other_entry = nothing # don't propagate the backtrace
         else
             other_id = pkgID(other_p, graph)
-            msg *= "requirements implicity induced by $other_id "
+            msg *= "$other_id "
         end
     end
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (other_entry, msg))
     return entry
 end
@@ -571,7 +581,7 @@ function add_bktrcentry_pruned!(graph::Graph, p0::Int, s0::Int)
     else
         msg = "fixed during graph pruning to its only remaining available version, $(pvers[p0][s0])"
     end
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
@@ -593,7 +603,7 @@ function add_bktrcentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
             msg = "set by the solver to the maximum version compatible with the constraints: $(pvers[p0][s0])"
         end
     end
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
@@ -617,7 +627,7 @@ function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbo
             msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate its constraints)"
         end
     end
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
@@ -638,7 +648,7 @@ function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
         msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate a dependecy relation with $other_id)"
     end
     other_entry = bktrc.pool[pkgs[p1]]
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (other_entry, msg))
     return entry
 end
@@ -662,34 +672,63 @@ function add_bktrcentry_eq_classes!(graph::Graph, p0::Int)
     p = pkgs[p0]
     id = pkgID(p, graph)
     msg = "versions reduced by equivalence to: $vns"
-    entry = bktrc.pool[p].reasons[1][1]
+    entry = bktrc.pool[p]
     push!(entry, (nothing, msg))
     return entry
 end
 
 "Show the full resolution backtrace"
-function showbacktrace(io::IO, graph::Graph)
-    _show(io, graph, graph.bktrc.init, "", ObjectIdDict())
+function showbacktrace(io::IO, graph::Graph; view::Symbol = :plain)
+    view ∈ [:plain, :tree, :chronological] || throw(ArgumentError("the view argument should be `:plain`, `:tree` or `:chronological`"))
+    println(io, "Resolve log:")
+    view == :chronological && return showbacktracejournal(io, graph)
+    seen = ObjectIdDict()
+    recursive = (view == :tree)
+    initentries = [event[1] for event in graph.bktrc.init.events]
+    for entry in sort!(initentries, by=(entry->pkgID(entry.pkg, graph)))
+        _show(io, graph, entry, "", seen, recursive)
+        recursive && (seen[entry] = true)
+    end
+end
+
+function showbacktracejournal(io::IO, graph::Graph)
+    journal = graph.bktrc.journal
+    padding = maximum(length(pkgID(p, graph)) for (p,_) in journal)
+    for (p, msg) in journal
+        println(io, ' ', rpad(pkgID(p, graph), padding), ": ", msg)
+    end
 end
 
 "Show the resolution backtrace for some package"
-function showbacktrace(io::IO, graph::Graph, p::UUID)
-    _show(io, graph, graph.bktrc.pool[p], "", ObjectIdDict())
+function showbacktrace(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
+    view ∈ [:plain, :tree] || throw(ArgumentError("the view argument should be `:plain` or `:tree`"))
+    recursive = (view == :tree)
+    _show(io, graph, graph.bktrc.pool[p], "", ObjectIdDict(), recursive)
 end
 
 # Show a recursive tree with requirements applied to a package, either directly or indirectly
-function _show(io::IO, graph::Graph, entry::ResolveBacktraceEntry, indent::String, seen::ObjectIdDict)
-    l = length(entry.reasons)
-    for (i,(otheritem,msg)) in enumerate(entry.reasons)
-        print(io, indent, (i==l ? '└' : '├'), '─')
-        println(io, msg)
+function _show(io::IO, graph::Graph, entry::ResolveBacktraceEntry, indent::String, seen::ObjectIdDict, recursive::Bool)
+    toplevel = isempty(indent)
+    firstglyph = toplevel ? "" : "└─"
+    pre = toplevel ? "" : "  "
+    println(io, indent, firstglyph, entry.header)
+    l = length(entry.events)
+    for (i,(otheritem,msg)) in enumerate(entry.events)
+        if !isempty(msg)
+            print(io, indent * pre, (i==l ? '└' : '├'), '─')
+            println(io, msg)
+            newindent = indent * pre * (i==l ? "  " : "│ ")
+        else
+            newindent = indent
+        end
         otheritem ≡ nothing && continue
+        recursive || continue
         if otheritem ∈ keys(seen)
-            println(io, indent, (i==l ? "  " : "│ "), "└─see above for the backtrace of $(pkgID(otheritem.pkg, graph))")
+            println(io, newindent, "└─", otheritem.header, " see above")
             continue
         end
         seen[otheritem] = true
-        _show(io, graph, otheritem, indent * (i==l ? "  " : "│ "), seen)
+        _show(io, graph, otheritem, newindent, seen, recursive)
     end
 end
 
