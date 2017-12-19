@@ -587,10 +587,59 @@ function add_bktrcentry_greedysolved!(graph::Graph, p0::Int, s0::Int)
     if s0 == spp[p0]
         msg = "determined to be unneeded by the solver"
     else
-        msg = "set by the solver to the maximum version compatible with the constraints: $(pvers[p0][s0])"
+        if s0 == spp[p0] - 1
+            msg = "set by the solver to its maximum version: $(pvers[p0][s0])"
+        else
+            msg = "set by the solver to the maximum version compatible with the constraints: $(pvers[p0][s0])"
+        end
     end
     entry = bktrc.pool[p].reasons[1][1]
     push!(entry, (nothing, msg))
+    return entry
+end
+
+function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, why::Symbol)
+    bktrc = graph.bktrc
+    spp = graph.spp
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    p = pkgs[p0]
+    id = pkgID(p, graph)
+    if s0 == spp[p0]
+        @assert why == :uninst
+        msg = "determined to be unneeded by the solver"
+    else
+        @assert why == :constr
+        if s0 == spp[p0] - 1
+            msg = "set by the solver to its maximum version: $(pvers[p0][s0])"
+        else
+            msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate its constraints)"
+        end
+    end
+    entry = bktrc.pool[p].reasons[1][1]
+    push!(entry, (nothing, msg))
+    return entry
+end
+
+function add_bktrcentry_maxsumsolved!(graph::Graph, p0::Int, s0::Int, p1::Int)
+    bktrc = graph.bktrc
+    spp = graph.spp
+    pkgs = graph.data.pkgs
+    pvers = graph.data.pvers
+
+    p = pkgs[p0]
+    id = pkgID(p, graph)
+    other_id = pkgID(p1, graph)
+    @assert s0 ≠ spp[p0]
+    if s0 == spp[p0] - 1
+        msg = "set by the solver to its maximum version: $(pvers[p0][s0]) (installation is required by $other_id)"
+    else
+        msg = "set by the solver version: $(pvers[p0][s0]) (version $(pvers[p0][s0+1]) would violate a dependecy relation with $other_id)"
+    end
+    other_entry = bktrc.pool[pkgs[p1]]
+    entry = bktrc.pool[p].reasons[1][1]
+    push!(entry, (other_entry, msg))
     return entry
 end
 
