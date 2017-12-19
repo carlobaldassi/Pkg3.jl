@@ -8,27 +8,26 @@ import Pkg3.equalto
 
 export Graph, add_reqs!, add_fixed!, simplify_graph!, showlog
 
-# This is used to keep track of dependency relations when propagating
-# requirements, so as to emit useful information in case of unsatisfiable
-# conditions.
-# The `why` field is a Vector which keeps track of the requirements. Each
-# entry is a Tuple of two elements:
-# 1) the first element is the reason, and it can be either :fixed (for
-#    fixed packages), :explicit_requirement (for explicitly required packages),
-#    or a Tuple `(:constr_prop, p, backtrace_entry)` (for requirements induced
-#    indirectly), where `p` is the package index and `backtrace_entry` is
-#    another ResolveLogEntry.
-# 2) the second element is a BitVector representing the requirement as a mask
-#    over the possible states of the package
+# The ResolveLog is used to keep track of events that take place during the
+# resolution process. We use one ResolveLogEntry per package, and record all events
+# associated with that package. An event consists of two items: another
+# entry representing another package's influence (or `nothing`) and
+# a message for the log.
+#
+# Specialized functions called `add_rlogentry_[...]!` are used to store the
+# various events. The events are also recorded in orded in a shared
+# ResolveJournal, which is used to provide a plain chronological view.
+#
+# The `showlog` functions are used for display, and called to create messages
+# in case of resolution errors.
 
 const ResolveJournal = Vector{Tuple{UUID,String}}
 
-# const ResolveLogEntry = Vector{Tuple{Union{ResolveLogEntry,Void},String}}
 mutable struct ResolveLogEntry
     journal::ResolveJournal # shared with all other entries
     pkg::UUID
     header::String
-    events::Vector{Tuple{Any,String}}
+    events::Vector{Tuple{Any,String}} # here Any should ideally be Union{ResolveLogEntry,Void}
     ResolveLogEntry(journal::ResolveJournal, pkg::UUID, msg::String = "") = new(journal, pkg, msg, [])
 end
 
@@ -38,6 +37,8 @@ function Base.push!(entry::ResolveLogEntry, reason::Tuple{Union{ResolveLogEntry,
     return entry
 end
 
+# Note: the `init` field is used to keep track of all entries which were there
+# at the beginning, since the `pool` can be pruned during the resolution process.
 mutable struct ResolveLog
     init::ResolveLogEntry
     pool::Dict{UUID,ResolveLogEntry}
@@ -676,7 +677,14 @@ function add_rlogentry_eq_classes!(graph::Graph, p0::Int)
     return entry
 end
 
-"Show the full resolution log"
+"""
+Show the full resolution log. The `view` keyword controls how the events are displayed/grouped:
+
+ * `:plain` for a shallow view, grouped by package, alphabetically (the default)
+ * `:tree` for a tree view in which the log of a package is displayed as soon as it appears
+           in the process (the top-level is still grouped by package, alphabetically)
+ * `:chronological` for a flat view of all events in chronological order
+"""
 function showlog(io::IO, graph::Graph; view::Symbol = :plain)
     view ∈ [:plain, :tree, :chronological] || throw(ArgumentError("the view argument should be `:plain`, `:tree` or `:chronological`"))
     println(io, "Resolve log:")
@@ -698,11 +706,29 @@ function showlogjournal(io::IO, graph::Graph)
     end
 end
 
-"Show the resolution log for some package"
+"""
+Show the resolution log for some package, and all the other packages that affected
+it during resolution. The `view` option can be either `:plain` or `:tree` (works
+the same as for `showlog(io, graph)`); the default is `:tree`.
+"""
 function showlog(io::IO, graph::Graph, p::UUID; view::Symbol = :tree)
     view ∈ [:plain, :tree] || throw(ArgumentError("the view argument should be `:plain` or `:tree`"))
-    recursive = (view == :tree)
-    _show(io, graph, graph.rlog.pool[p], "", ObjectIdDict(), recursive)
+    if view == :tree
+        _show(io, graph, graph.rlog.pool[p], "", ObjectIdDict(), true)
+    else
+        entries = ResolveLogEntry[graph.rlog.pool[p]]
+        function getentries(entry)
+            for (other_entry,_) in entry.events
+                (other_entry ≡ nothing || other_entry ∈ entries) && continue
+                push!(entries, other_entry)
+                getentries(other_entry)
+            end
+        end
+        getentries(graph.rlog.pool[p])
+        for entry in entries
+            _show(io, graph, entry, "", ObjectIdDict(), false)
+        end
+    end
 end
 
 # Show a recursive tree with requirements applied to a package, either directly or indirectly
