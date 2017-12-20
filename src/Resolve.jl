@@ -140,8 +140,8 @@ function sanity_check(graph::Graph, sources::Set{UUID} = Set{UUID}(); verbose::B
         msgs = Messages(sub_graph)
 
         try
-            sol = maxsum(graph, msgs)
-            @assert verify_solution(sol)
+            sol = maxsum(sub_graph, msgs)
+            @assert verify_solution(sol, sub_graph)
         catch err
             isa(err, UnsatError) || rethrow(err)
             for vneq in eq_classes[p][vn]
